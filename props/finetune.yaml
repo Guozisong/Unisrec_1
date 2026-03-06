@@ -1,0 +1,25 @@
+data_path: 'dataset/downstream/'
+benchmark_filename: [train, valid, test]
+alias_of_item_id: [item_id_list]
+load_col:
+  inter: [user_id, item_id_list, item_id]
+train_neg_sample_args: ~
+unisrec_transform: ~
+
+MAX_ITEM_LIST_LENGTH: 100
+topk: [50]
+metrics: [HIT]
+valid_metric: HIT@50
+eval_batch_size: 1024
+eval_step: 5
+stopping_step: 10
+
+train_stage: transductive_ft
+epochs: 20
+train_batch_size: 1024
+weight_decay: 0.0
+shuffle: True
+
+learning_rate: 0.002
+
+show_progress: False

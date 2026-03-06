@@ -1,0 +1,25 @@
+data_path: 'dataset/pretrain/'
+benchmark_filename: [train]
+alias_of_item_id: [item_id_list]
+load_col:
+  inter: [user_id, item_id_list, item_id]
+train_neg_sample_args: ~
+unisrec_transform: plm_emb
+
+train_stage: pretrain
+
+MAX_ITEM_LIST_LENGTH: 100
+pretrain_epochs: 100
+save_step: 1
+train_batch_size: 1280
+learning_rate: 0.001
+
+
+log_wandb: True
+logging_type: wandb
+wandb_project: unisrec_project_pretrain
+
+
+
+
+
