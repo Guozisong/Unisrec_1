@@ -6,16 +6,16 @@
 
 | 阶段 | 核心目标 | 适用场景 |
 | :--- | :--- | :--- |
-| **预训练 (Pre-training)** | 学习通用的序列表示和跨域商品特征。 | 利用大规模多领域数据，训练一个通用的序列编码器。 |
-| **微调 (Fine-tuning)** | 适配特定领域的推荐任务（预测下一个商品）。 | 将通用编码器迁移到具体的下游数据集（如 `lianhua`）。 |
+| **预训练 (Pre-training)** | 从交互序列与文本特征学习序列表示。 | 在当前数据集上训练序列编码器。 |
+| **微调 (Fine-tuning)** | 适配下一个商品预测任务。 | 从当前数据集的预训练权重继续训练。 |
 
 ## 2. 数据集与输入 (Dataset & Input)
 
 | 特性 | 预训练 (Pre-training) | 微调 (Fine-tuning) |
 | :--- | :--- | :--- |
-| **数据来源** | **多数据集混合**。从 `dataset.pt_datasets` 读取多个数据集列表。 | **单数据集**。针对特定的目标领域（如 `lianhua`）。 |
+| **数据来源** | 当前流水线读取 `<dataset>.train.inter`。 | 当前流水线读取同一次预处理得到的 `<dataset>` 训练、验证和测试文件。 |
 | **商品表示** | **纯文本特征 (PLM)**。利用 BERT 等模型提取的通用文本向量 (`plm_emb`)。 | **PLM + ID Embedding**。在 Transductive 模式下，结合 PLM 特征和领域特定的 Item ID Embedding。 |
-| **ID 映射** | **跨域映射**。需要处理 `iid2domain`，记录商品所属的域。 | **域内映射**。标准的序列推荐 ID 映射。 |
+| **ID 映射** | 当前入口使用 `UniSRecDataset` 的单数据集商品映射。 | 使用同一数据集的商品映射。 |
 | **输入 X** | 原始序列 (`item_seq`) + **增强序列** (`item_seq_aug`)。 | 仅原始序列 (`item_seq`)。 |
 | **数据加载类** | `UniSRecDataset`（通过预训练配置加载增强特征） | `UniSRecDataset` |
 
@@ -58,6 +58,6 @@
 
 ## 5. 代码实现参考 (Code References)
 
-*   **数据集定义**: [`UniSRecDataset`](data/dataset.py)
-*   **数据增强**: [`PLMEmb`](data/transform.py)（Item Drop / Word Drop）
-*   **模型与损失**: [`UniSRec`](unisrec.py)（预训练对比损失与微调交叉熵损失）
+*   **数据集定义**: [`UniSRecDataset`](../recbole_data/dataset.py)
+*   **数据增强**: [`PLMEmb`](../recbole_data/transform.py)（Item Drop / Word Drop）
+*   **模型与损失**: [`UniSRec`](../unisrec.py)（预训练对比损失与微调交叉熵损失）

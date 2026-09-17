@@ -5,17 +5,24 @@ usage() {
   cat <<'EOF'
 Usage: bash run.sh [options]
 
-Run one stage or the complete ODPS-to-prediction pipeline.
+Run one stage or the complete interaction-to-recommendation pipeline.
 
 Options:
   --stage NAME         all, fetch, preprocess, pretrain, finetune, or predict (default: all)
-  --dataset NAME       Dataset name (currently lianhua; default: lianhua)
-  --work-dir DIR       Raw data, processed data, checkpoints, and results (default: /ml/output)
+  --dataset NAME       Dataset name used for intermediate files (required)
+  --input-csv FILE     Interaction CSV for fetch (alternative to --input-table)
+  --input-table NAME   ODPS interaction table for fetch
+  --input-query-file FILE  ODPS SQL for fetch (alternative to table)
+  --item-metadata-csv FILE   CSV with item_id, category_id for prediction
+  --eligible-items-csv FILE CSV with item_id for prediction
+  --item-metadata-table NAME ODPS item/category table for prediction
+  --eligible-items-table NAME ODPS eligible item table for prediction
+  --work-dir DIR       Raw data, processed data, checkpoints, and results (default: project outputs/)
   --plm-path DIR       Local text encoder directory (default: ./bert-base-uncased)
-  --env-file FILE      ODPS credentials file (default: /ml/output/.env)
+  --env-file FILE      ODPS connection file (default: project .env)
   --python EXECUTABLE  Python executable (default: python3)
   --top-k NUMBER       Number of recommended items (default: 50)
-  --output-table NAME  ODPS result table (default: lianhua_tmp_Unisrec_uid2simitem)
+  --output-table NAME  Optional ODPS result table; predictions are always saved as CSV
   --pretrained-checkpoint FILE  Weight file for a standalone finetune stage
   --finetuned-checkpoint FILE   Weight file for a standalone predict stage
   -h, --help           Show this help
@@ -24,23 +31,37 @@ EOF
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 stage=all
-dataset=lianhua
-work_dir=/ml/output
+dataset=
+input_csv=
+input_table=
+input_query_file=
+item_metadata_csv=
+eligible_items_csv=
+item_metadata_table=
+eligible_items_table=
+work_dir=$repo_dir/outputs
 plm_path=$repo_dir/bert-base-uncased
-env_file=/ml/output/.env
+env_file=$repo_dir/.env
 python=python3
 top_k=50
-output_table=lianhua_tmp_Unisrec_uid2simitem
+output_table=
 pretrained_checkpoint=
 finetuned_checkpoint=
 
 while (($#)); do
   case "$1" in
-    --stage|--dataset|--work-dir|--plm-path|--env-file|--python|--top-k|--output-table|--pretrained-checkpoint|--finetuned-checkpoint)
+    --stage|--dataset|--input-csv|--input-table|--input-query-file|--item-metadata-csv|--eligible-items-csv|--item-metadata-table|--eligible-items-table|--work-dir|--plm-path|--env-file|--python|--top-k|--output-table|--pretrained-checkpoint|--finetuned-checkpoint)
       if (($# < 2)); then echo "Missing value for $1" >&2; exit 2; fi
       case "$1" in
         --stage) stage=$2 ;;
         --dataset) dataset=$2 ;;
+        --input-csv) input_csv=$2 ;;
+        --input-table) input_table=$2 ;;
+        --input-query-file) input_query_file=$2 ;;
+        --item-metadata-csv) item_metadata_csv=$2 ;;
+        --eligible-items-csv) eligible_items_csv=$2 ;;
+        --item-metadata-table) item_metadata_table=$2 ;;
+        --eligible-items-table) eligible_items_table=$2 ;;
         --work-dir) work_dir=$2 ;;
         --plm-path) plm_path=$2 ;;
         --env-file) env_file=$2 ;;
@@ -68,9 +89,24 @@ if [[ -n "$finetuned_checkpoint" && "$stage" != predict ]]; then
   echo "--finetuned-checkpoint is only used with --stage predict" >&2
   exit 2
 fi
-if [[ "$dataset" != lianhua ]]; then
-  echo "Only the lianhua ODPS source is configured" >&2
+if [[ ! "$dataset" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+  echo "--dataset is required and must contain letters, digits, or underscores, starting with a letter" >&2
   exit 2
+fi
+if [[ "$stage" == all || "$stage" == fetch ]]; then
+  sources=0
+  for source in "$input_csv" "$input_table" "$input_query_file"; do if [[ -n "$source" ]]; then ((sources+=1)); fi; done
+  if ((sources != 1)); then
+    echo "Choose exactly one of --input-csv, --input-table, or --input-query-file for fetch" >&2
+    exit 2
+  fi
+fi
+if [[ "$stage" == all || "$stage" == predict ]]; then
+  if [[ -z "$item_metadata_csv" && -z "$item_metadata_table" ]] || [[ -z "$eligible_items_csv" && -z "$eligible_items_table" ]] ||
+     [[ -n "$item_metadata_csv" && -n "$item_metadata_table" ]] || [[ -n "$eligible_items_csv" && -n "$eligible_items_table" ]]; then
+    echo "Prediction requires one metadata source and one eligible-item source (CSV or ODPS table)" >&2
+    exit 2
+  fi
 fi
 if [[ ! "$top_k" =~ ^[1-9][0-9]*$ ]]; then
   echo "--top-k must be a positive integer" >&2
@@ -87,13 +123,29 @@ if [[ "$stage" == all || "$stage" == preprocess ]]; then
   fi
   plm_path=$(cd "$plm_path" && pwd)
 fi
-if [[ "$stage" == all || "$stage" == fetch || "$stage" == predict ]]; then
+if [[ ( "$stage" == all || "$stage" == fetch ) && -n "$input_csv" && ! -f "$input_csv" ]] ||
+   [[ ( "$stage" == all || "$stage" == fetch ) && -n "$input_query_file" && ! -f "$input_query_file" ]]; then
+  echo "Interaction input file does not exist" >&2
+  exit 2
+fi
+if [[ ( "$stage" == all || "$stage" == predict ) && -n "$item_metadata_csv" && ! -f "$item_metadata_csv" ]] ||
+   [[ ( "$stage" == all || "$stage" == predict ) && -n "$eligible_items_csv" && ! -f "$eligible_items_csv" ]]; then
+  echo "Prediction metadata CSV does not exist" >&2
+  exit 2
+fi
+if [[ ( "$stage" == all || "$stage" == fetch ) && ( -n "$input_table" || -n "$input_query_file" ) ]] ||
+   [[ ( "$stage" == all || "$stage" == predict ) && ( -n "$item_metadata_table" || -n "$eligible_items_table" || -n "$output_table" ) ]]; then
   if [[ ! -f "$env_file" ]]; then
     echo "ODPS credentials file does not exist: $env_file" >&2
     exit 2
   fi
   env_file=$(cd "$(dirname "$env_file")" && pwd)/$(basename "$env_file")
 fi
+for source in input_csv input_query_file item_metadata_csv eligible_items_csv; do
+  if [[ -n "${!source}" ]]; then
+    printf -v "$source" '%s/%s' "$(cd "$(dirname "${!source}")" && pwd)" "$(basename "${!source}")"
+  fi
+done
 if [[ "$stage" == finetune ]]; then
   if [[ -z "$pretrained_checkpoint" || ! -f "$pretrained_checkpoint" ]]; then
     echo "--stage finetune requires --pretrained-checkpoint FILE" >&2
@@ -120,7 +172,15 @@ cd "$repo_dir"
 
 fetch() {
   mkdir -p "$raw_dir"
-  "$python" dataset/raw/get_data_from_odps.py --output-dir "$raw_dir" --env-file "$env_file"
+  local source=(--dataset "$dataset" --output-dir "$raw_dir")
+  if [[ -n "$input_csv" ]]; then
+    source+=(--input-csv "$input_csv")
+  elif [[ -n "$input_query_file" ]]; then
+    source+=(--input-query-file "$input_query_file" --env-file "$env_file")
+  else
+    source+=(--input-table "$input_table" --env-file "$env_file")
+  fi
+  "$python" data_pipeline/raw/prepare_interactions.py "${source[@]}"
 }
 
 preprocess() {
@@ -129,7 +189,7 @@ preprocess() {
     exit 1
   fi
   mkdir -p "$data_dir"
-  "$python" dataset/preprocessing/process_or.py --dataset "$dataset" --input_path "$raw_dir" \
+  "$python" data_pipeline/preprocessing/preprocess.py --dataset "$dataset" --input_path "$raw_dir" \
     --output_path "$data_dir" --plm_name "$plm_path" --word_drop_ratio 0.2
 }
 
@@ -187,8 +247,12 @@ predict() {
     exit 1
   fi
   mkdir -p "$result_dir"
-  "$python" predict.py -d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir" \
-    --data-path "$data_dir" --env-file "$env_file" --output-table "$output_table"
+  local sources=(--data-path "$data_dir")
+  if [[ -n "$item_metadata_csv" ]]; then sources+=(--item-metadata-csv "$item_metadata_csv"); else sources+=(--item-metadata-table "$item_metadata_table"); fi
+  if [[ -n "$eligible_items_csv" ]]; then sources+=(--eligible-items-csv "$eligible_items_csv"); else sources+=(--eligible-items-table "$eligible_items_table"); fi
+  if [[ -n "$item_metadata_table" || -n "$eligible_items_table" || -n "$output_table" ]]; then sources+=(--env-file "$env_file"); fi
+  if [[ -n "$output_table" ]]; then sources+=(--output-table "$output_table"); fi
+  "$python" predict.py -d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir" "${sources[@]}"
 }
 
 case "$stage" in

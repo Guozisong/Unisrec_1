@@ -3,37 +3,27 @@ from recbole.config import Config
 from recbole.data import data_preparation
 
 from unisrec import UniSRec
-from data.dataset import UniSRecDataset
+from recbole_data.dataset import UniSRecDataset
 import torch
 import numpy as np
 import pandas as pd
 import json
 import os
+import re
 from datetime import datetime
-from odps import ODPS
 from odps.models import Schema, Column
-from dotenv import load_dotenv
-
-def connect_odps(env_file):
-    # 建立链接。
-    load_dotenv(env_file, override=True)
-    access_id = os.getenv("ALI_ACCESS_ID")
-    access_key = os.getenv("ALI_SECRET_ACCESS_KEY")
-    if not access_id or not access_key:
-        raise ValueError('ODPS credentials are missing from the environment file')
-    project = 'jxaidataworks'
-    endpoint = 'https://service.cn-hangzhou-vpc.maxcompute.aliyun-inc.com/api'
-
-    return ODPS(access_id, access_key, project, endpoint=endpoint)
+from data_pipeline.raw.get_data_from_odps import connect_odps
 
 
 def write_to_odps(df1, env_file, table_name1):
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]*', table_name1):
+        raise ValueError('ODPS table name must contain only letters, digits, underscores, or dots')
     odps = connect_odps(env_file)
 
     columns = [
         Column(name='user_id', type='string', comment='用户索引'),
-        Column(name='prod_id', type='string', comment='商品索引'),
-        Column(name='similarity_score', type='double', comment='相似分数')]
+        Column(name='item_id', type='string', comment='Item identifier'),
+        Column(name='score', type='double', comment='Recommendation score')]
 
     schema = Schema(columns=columns)
     
@@ -50,28 +40,23 @@ def write_to_odps(df1, env_file, table_name1):
 
     print(f"Data has been written to {table_name1}")
 
-def read_from_odps(env_file):
+def read_from_odps(env_file, metadata_table, eligible_table):
     odps = connect_odps(env_file)
-
-    # 商品品类
-    sql_1 = '''SELECT prod_id, cate_level5_code FROM unisrec_items_info;'''
-    # 在售商品
-    sql_2 = '''SELECT prod_id FROM lianhua_recall_station_brand_category_grade_base_tmp GROUP BY prod_id;'''
+    for table in (metadata_table, eligible_table):
+        if table and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]*', table):
+            raise ValueError('ODPS table name must contain only letters, digits, underscores, or dots')
+    sql_1 = f'SELECT item_id, category_id FROM {metadata_table}' if metadata_table else None
+    sql_2 = f'SELECT item_id FROM {eligible_table}' if eligible_table else None
     
-    query_job_1 = odps.execute_sql(sql_1)
-    items_info_1 = query_job_1.open_reader(tunnel=True)
-    items_info_1 = items_info_1.to_pandas(n_process=4)
-    
-    query_job_2 = odps.execute_sql(sql_2)
-    items_info_2 = query_job_2.open_reader(tunnel=True)
-    items_info_2 = items_info_2.to_pandas(n_process=4)
+    items_info_1 = odps.execute_sql(sql_1).open_reader(tunnel=True).to_pandas(n_process=4) if sql_1 else None
+    items_info_2 = odps.execute_sql(sql_2).open_reader(tunnel=True).to_pandas(n_process=4) if sql_2 else None
     return (items_info_1, items_info_2)
 
 
 def diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=10, top_k=50):
-    # 建立 prod_id -> cate_id 映射字典
-    prod2cate = dict(zip(prod_cate_info['prod_id'], prod_cate_info['cate_level5_code']))
-    valid_prod = set(valid_prod['prod_id'].to_list())
+    # 建立 item_id -> category_id 映射字典
+    item2category = dict(zip(prod_cate_info['item_id'], prod_cate_info['category_id']))
+    valid_items = set(valid_prod['item_id'].to_list())
 
     diversified_items = [] 
     diversified_scores = []
@@ -83,11 +68,11 @@ def diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_
 
         for item, score in zip(items, scores):
 
-            cate_id = prod2cate.get(item, None)
+            cate_id = item2category.get(item, None)
             if cate_id is None:
                 continue 
             # 保证商品有效
-            if item not in valid_prod: 
+            if item not in valid_items:
                 continue
 
             if cate_count.get(cate_id, 0) < max_per_cate: # 保证每个指定品类商品数不超过阈值
@@ -116,9 +101,10 @@ def _full_sort_batch_eval(batched_data, model, device, tot_item_num):
 
 
 def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
-              env_file='/ml/output/.env', output_table='lianhua_tmp_Unisrec_uid2simitem'):
+              env_file='.env', output_table=None, item_metadata_csv=None,
+              eligible_items_csv=None, item_metadata_table=None, eligible_items_table=None):
     # 配置文件
-    props = ['props/UniSRec.yaml', 'props/finetune.yaml']
+    props = ['configs/UniSRec.yaml', 'configs/finetune.yaml']
     overrides = {'data_path': data_path} if data_path else None
     config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=overrides)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -196,7 +182,17 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
 
     
     # 推荐商品按照三级品类打散, 同一品类下的商品至多保留 n 个，且均为目前在售商品
-    prod_cate_info, valid_prod = read_from_odps(env_file)
+    odps_metadata, odps_eligible = (None, None)
+    if item_metadata_table or eligible_items_table:
+        odps_metadata, odps_eligible = read_from_odps(env_file, item_metadata_table, eligible_items_table)
+    prod_cate_info = pd.read_csv(item_metadata_csv, dtype=str) if item_metadata_csv else odps_metadata
+    valid_prod = pd.read_csv(eligible_items_csv, dtype=str) if eligible_items_csv else odps_eligible
+    for frame, columns in ((prod_cate_info, ('item_id', 'category_id')), (valid_prod, ('item_id',))):
+        missing = set(columns) - set(frame.columns)
+        if missing:
+            raise ValueError(f'Prediction source missing columns: {", ".join(sorted(missing))}')
+        for column in columns:
+            frame[column] = frame[column].astype(str)
     rec_items, rec_items_score = diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=2, top_k=top_k)
     n = len(users)
     m = 0
@@ -211,24 +207,19 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
         "推荐商品得分": rec_items_score
     })
     
-    csv_path = os.path.join(result_save_path, "predict_result-{}-{}.csv".format(str(round(m/n, 4)), str(datetime.now().date())))
+    csv_path = os.path.join(result_save_path, f'{dataset}-details-{datetime.now().date()}.csv')
+    df.columns = ['user_id', 'history_item_ids', 'target_item_id', 'recommended_item_ids', 'recommendation_scores']
+    for column in ('history_item_ids', 'recommended_item_ids', 'recommendation_scores'):
+        df[column] = df[column].map(json.dumps)
     df.to_csv(csv_path, encoding='utf-8-sig', index=False)
     print(f"已保存到 {csv_path}")
+    print(f'Hit rate in saved details: {m / n:.4f}' if n else 'No prediction rows')
     # 购买序列长度前150000的用户
     n_users = [user for user, seq in sorted(zip(users, items_seq), key=lambda x: len(x[1]), reverse=True)[:150000]]
     
     data = []
     rec_items_score = [[round(x, 6) for x in row] for row in rec_items_score]
     
-    # 手动添加试验用户
-    source_user = 'a7f4dc8da5164063b9decf3aff6958f9'
-    if source_user in users:
-        n_users.append('2a13f1cb662a4c44854ca823eaa6ec75')
-        i = users.index(source_user)
-        users.append('2a13f1cb662a4c44854ca823eaa6ec75')
-        rec_items.append(rec_items[i])
-        rec_items_score.append(rec_items_score[i])
-
     n_users = list(set(n_users))
      
 
@@ -237,21 +228,31 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
             continue
         for item, score in zip(items, scores):
             data.append([user, item, score])
-    df1 = pd.DataFrame(data, columns=['user_id', 'prod_id', 'similarity_score'])
-    write_to_odps(df1, env_file, output_table)
-    print("已保存到Dataworks")
+    df1 = pd.DataFrame(data, columns=['user_id', 'item_id', 'score'])
+    df1.to_csv(os.path.join(result_save_path, f'{dataset}-recommendations.csv'), index=False, encoding='utf-8')
+    if output_table:
+        write_to_odps(df1, env_file, output_table)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', type=str, default='lianhua', help='dataset name')
+    parser.add_argument('-d', type=str, required=True, help='dataset name')
     parser.add_argument('-fp', type=str, required=True, help='finetuned model path')
     parser.add_argument('-t', type=int, default=50, help='top k scoring items')
-    parser.add_argument('-sp', type=str, default='/ml/output/result/', help= 'result save path')
+    parser.add_argument('-sp', type=str, default='outputs/results/', help= 'result save path')
     parser.add_argument('--data-path', help='parent directory of the dataset')
-    parser.add_argument('--env-file', default='/ml/output/.env')
-    parser.add_argument('--output-table', default='lianhua_tmp_Unisrec_uid2simitem')
+    parser.add_argument('--env-file', default='.env')
+    parser.add_argument('--output-table')
+    parser.add_argument('--item-metadata-csv')
+    parser.add_argument('--eligible-items-csv')
+    parser.add_argument('--item-metadata-table')
+    parser.add_argument('--eligible-items-table')
     args = parser.parse_args()
     if args.t < 1:
         parser.error('-t must be a positive integer')
 
-    predictor(args.d, args.fp, args.t, args.sp, args.data_path, args.env_file, args.output_table)
+    if (bool(args.item_metadata_csv) == bool(args.item_metadata_table) or
+            bool(args.eligible_items_csv) == bool(args.eligible_items_table)):
+        parser.error('Supply one metadata source and one eligible-item source (CSV or ODPS table)')
+    predictor(args.d, args.fp, args.t, args.sp, args.data_path, args.env_file, args.output_table,
+              args.item_metadata_csv, args.eligible_items_csv,
+              args.item_metadata_table, args.eligible_items_table)

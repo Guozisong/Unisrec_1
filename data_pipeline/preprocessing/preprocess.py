@@ -3,9 +3,9 @@ import csv
 import datetime
 import os
 from tqdm import tqdm
-from utils1_production_env import filter_inters, make_inters_in_order, get_user_item_from_ratings, \
+from preprocessing_utils import filter_inters, make_inters_in_order, get_user_item_from_ratings, \
     generate_training_data, generate_item_embedding, convert_to_atomic_files
-from utils2 import check_path, set_device, load_plm
+from preprocessing_runtime import check_path, set_device, load_plm
 import time
 import json
 
@@ -18,13 +18,13 @@ def load_ratings(file):
         for line in tqdm(cr, desc='Load ratings'):
             try:
                 # 用户id, 商品id, 购买数量, 购买时间, 商品属性
-                user_id, prod_id, purchase_count, dt, attrvalues = line
-                if '' in (user_id, prod_id, purchase_count, dt, attrvalues):
+                user_id, item_id, event_value, event_time, item_text = line
+                if '' in (user_id, item_id, event_value, event_time, item_text):
                     continue
                 users.add(user_id)
-                items.add(prod_id)
-                ts = datetime.datetime.strptime(dt, '%Y-%m-%d').timestamp()
-                inters.add((user_id, prod_id, float(purchase_count), int(ts)))
+                items.add(item_id)
+                ts = datetime.datetime.strptime(event_time, '%Y-%m-%d').timestamp()
+                inters.add((user_id, item_id, float(event_value), int(ts)))
             except ValueError:
                 print(line)
     return users, items, inters
@@ -63,11 +63,11 @@ def generate_text(args, items):
         cr = csv.reader(fp)
         for line in tqdm(cr, desc='Load ratings'):
             try:
-                user_id, prod_id, purchase_count, dt, attrvalues = line
-                if '' in (user_id, prod_id, purchase_count, dt, attrvalues):
+                user_id, item_id, event_value, event_time, item_text = line
+                if '' in (user_id, item_id, event_value, event_time, item_text):
                     continue
-                if prod_id not in item2text:
-                    item2text[prod_id] = attrvalues
+                if item_id not in item2text:
+                    item2text[item_id] = item_text
             except ValueError:
                 print(line)
 
@@ -93,12 +93,12 @@ def preprocess_text(args, rating_inters):
 # user_k_max设置一个较大值，目的是不过滤购买序列较长的用户，实际上只截取所有序列后50个商品序列用于构造训练和测试集
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='lianhua')
+    parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--user_k_min', type=int, default=3, help='user k-core filtering')
     parser.add_argument('--user_k_max', type=int, default=500, help='user k-core filtering')
     parser.add_argument('--item_k', type=int, default=5, help='item k-core filtering')
-    parser.add_argument('--input_path', type=str, default='/ml/output/raw/')
-    parser.add_argument('--output_path', type=str, default='/ml/output/downstream/')
+    parser.add_argument('--input_path', type=str, default='outputs/raw/')
+    parser.add_argument('--output_path', type=str, default='outputs/downstream/')
     parser.add_argument('--gpu_id', type=int, default=0, help='ID of running GPU')
     parser.add_argument('--plm_name', type=str, default='./bert-base-uncased/')
     parser.add_argument('--emb_type', type=str, default='CLS', help='item text emb type, can be CLS or Mean')

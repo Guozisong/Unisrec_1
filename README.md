@@ -1,91 +1,135 @@
-# UniSRec_1
+# UniSRec 序列推荐
 
-基于 RecBole 和 PyTorch 的序列推荐项目。当前取数 SQL、商品筛选查询和默认输出表均针对 `lianhua`；模型支持预训练、微调和全量商品打分。
+基于 RecBole、PyTorch 和商品文本向量的序列推荐流水线。数据集名称只用于文件和模型命名，不限定数据来源。通过 Bash 入口 `run.sh` 可以按顺序执行完整流程，也可以独立执行任一阶段。
 
-## 目录
+## 项目结构
 
 ```text
-run.sh                         完整流程与独立阶段入口
-dataset/raw/get_data_from_odps.py  从 ODPS 导出交互数据
-dataset/preprocessing/        清洗交互并生成商品文本向量
-data/                         RecBole 数据集、加载器和数据增强
-unisrec.py                    模型和损失函数
-pretrain.py                   预训练入口
-finetune.py                   微调入口
-predict.py                    预测和 ODPS 结果写入入口
-props/                        RecBole YAML 配置
-tests/                        流程入口测试
+run.sh                         完整流水线与独立阶段入口
+unisrec.py                     模型定义
+pretrain.py                    预训练入口
+finetune.py                    微调入口
+predict.py                     预测及可选的 ODPS 写表
+recbole_data/                  RecBole 数据集、加载器、数据增强
+data_pipeline/raw/             CSV 标准化与 ODPS 取数
+data_pipeline/preprocessing/   交互清洗、原子文件和文本向量生成
+configs/                       训练配置
+docs/                          训练阶段说明
+tests/                         入口及数据契约测试
+outputs/                       默认产物目录，由 Git 忽略
 ```
 
-运行时数据和权重由 `--work-dir` 指定，不包含在仓库中。
+`data_pipeline/preprocessing/legacy_preprocessing_utils.py` 是未被当前入口调用的历史划分实现。训练和预测的算法仍在相应脚本中；部署环境提供符合以下字段约定的输入。
 
-## 环境
+## 数据契约
 
-需要 Python、PyTorch、RecBole、Transformers、PyODPS 和项目依赖。`requirements.txt` 中的 PyTorch 为 CUDA 11.6 构建；应在匹配的 Linux/CUDA 环境中安装。文本编码器模型需提前放在本地目录，默认目录为仓库下的 `bert-base-uncased/`。ODPS 凭据文件默认位于 `/ml/output/.env`，使用 `ALI_ACCESS_ID` 和 `ALI_SECRET_ACCESS_KEY`。
+### 交互数据
+
+`fetch` 接收 CSV 文件、ODPS 表或 ODPS SQL 文件。统一后的 CSV 位于 `W/raw/<dataset>.csv`，其中 `W` 表示 `--work-dir`。字段如下，允许源文件有额外列且列顺序任意：
+
+| 字段 | 含义 | 格式示例 |
+| --- | --- | --- |
+| `user_id` | 原始用户 ID | `u001` |
+| `item_id` | 原始商品或内容 ID | `i001` |
+| `event_value` | 交互权重；当前预处理会读取为数字 | `1` |
+| `event_time` | 交互日期；用于用户序列排序 | `2026-01-01` |
+| `item_text` | 文本编码器使用的商品描述 | `Item title and attributes` |
+
+历史 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式。预处理跳过这些字段中有空值的行；日期需要是 `YYYY-MM-DD`。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
+
+### 预测商品信息
+
+预测阶段还需要两份数据，可以分别来自 CSV 或 ODPS 表：
+
+- 商品品类：`item_id,category_id`，用于每个品类最多保留 2 个商品的现有打散规则。
+- 可推荐商品：`item_id`，用于筛选当前有效的商品。
+
+CSV 标识符按字符串读取，前导零会保留。ODPS 表也应提供这些列名；不同生产表结构可建立视图，或在导出 CSV 时改列名。ODPS 表名均在运行时传入，项目不依赖固定表名。
+
+## 环境与目录
+
+安装 `requirements.txt`，并准备本地文本编码器目录。文件中的 PyTorch 构建面向 CUDA 11.6，应使用匹配的运行环境。ODPS 模式在项目根目录的 `.env` 中读取连接参数，也可用 `--env-file` 指定其他文件；`.env` 已被 Git 忽略：
+
+```dotenv
+access_id=your_access_id
+access_key=your_access_key
+project=your_project
+endpoint=https://your-maxcompute-endpoint/api
+```
+
+默认工作目录是项目内的 `outputs/`，目录布局如下：
+
+```text
+outputs/
+├── raw/<dataset>.csv
+├── downstream/<dataset>/
+│   ├── <dataset>.train.inter / .valid.inter / .test.inter
+│   ├── <dataset>.feat1CLS / .feat2CLS
+│   └── index2user.json / index2item.json
+├── checkpoints/pretrain/*.pth
+├── checkpoints/finetune/UniSRec-<dataset>-finetuned.pth
+└── results/
+    ├── <dataset>-details-<date>.csv
+    └── <dataset>-recommendations.csv
+```
+
+在 PAI 可视化建模组件中，用 `--work-dir "$PAI_OUTPUT_DIR"` 指向组件实际挂载的输出目录；`PAI_OUTPUT_DIR` 是示例变量，需由部署环境设置。所有阶段使用相同工作目录。凭据与文本编码器也可分别通过 `--env-file`、`--plm-path` 指向部署环境的实际位置，仓库不包含固定挂载路径。
 
 ## 完整流程
 
+使用 CSV 输入，并将推荐结果写入 CSV：
+
 ```bash
-bash run.sh \
-  --stage all \
-  --dataset lianhua \
-  --work-dir /ml/output \
-  --plm-path /path/to/local/bert-model \
-  --env-file /ml/output/.env \
-  --python python3 \
-  --top-k 50
+bash run.sh --stage all --dataset catalog \
+  --input-csv /path/to/interactions.csv \
+  --item-metadata-csv /path/to/item_metadata.csv \
+  --eligible-items-csv /path/to/eligible_items.csv \
+  --plm-path /path/to/text_encoder
 ```
 
-查看参数：`bash run.sh --help`。目前完整流程只支持 `lianhua` 数据源。命令会依次：
+ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_table`，或使用 `--input-query-file /path/to/query.sql`；预测数据可用 `--item-metadata-table your_metadata_table` 和 `--eligible-items-table your_eligible_items_table`。如需将结果写回 ODPS，传入 `--output-table your_result_table`，并用 `--env-file` 指向连接配置。CSV 与 ODPS 商品信息可以分别选择，不要求来自同一种存储。
 
-1. 从 ODPS 导出近期交互到 `<work-dir>/raw/lianhua.csv`（日期范围以取数 SQL 为准）。
-2. 过滤交互、生成训练/验证/测试原子文件，以及 `feat1CLS` 和 `feat2CLS` 商品文本向量，保存在 `<work-dir>/downstream/lianhua/`。
-3. 用该数据预训练，权重保存在 `<work-dir>/checkpoints/pretrain/`，并将本次保存的模型传给微调。
-4. 加载预训练权重进行微调，保存到 `<work-dir>/checkpoints/finetune/UniSRec-lianhua-finetuned.pth`。
-5. 将预测 CSV 保存到 `<work-dir>/results/`，并写入 `--output-table` 指定的 ODPS 表。
+查询文件必须返回交互数据契约中的五列，历史字段也受支持。需要原来的近期交互窗口时，可在 SQL 中继续使用日期条件。请审查实际 SQL 和 ODPS 目标表；写表时会删除已有同名表并重建。
 
-## 数据流与阶段交接
+`bash run.sh --help` 列出所有参数。省略 `--stage` 等同于 `--stage all`。
 
-以下用 `W` 表示 `--work-dir`。`--stage all` 按图中顺序执行；独立运行阶段时，从已有的上游文件继续。
+迁移已有 ODPS 部署时，需要将原商品信息字段映射为 `item_id,category_id`，将可推荐商品字段映射为 `item_id`。可选结果表现在使用 `user_id,item_id,score`，原先依赖其他列名的下游任务需要同步调整。原来写死的试验用户复制规则已移除，推荐结果只包含真实输入用户。
+
+## 数据流与输出
 
 ```mermaid
 flowchart LR
-    A[ODPS: unisrec_raw_data] -->|fetch| B[W/raw/lianhua.csv]
-    B -->|preprocess| C[W/downstream/lianhua/]
-    C -->|train.inter + feat1CLS + feat2CLS| D[pretrain]
-    D --> E[W/checkpoints/pretrain/*.pth]
-    C -->|train/valid/test.inter + feat1CLS| F[finetune]
-    E --> F
-    F --> G[W/checkpoints/finetune/UniSRec-lianhua-finetuned.pth]
-    C -->|test.inter + ID 映射 + feat1CLS| H[predict]
-    G --> H
-    I[ODPS: 商品品类表和在售商品表] --> H
-    H --> J[W/results/predict_result-*.csv]
-    H --> K[ODPS: --output-table]
+    A[CSV / ODPS 表 / ODPS SQL] -->|fetch: 字段与列顺序标准化| B[W/raw/D.csv]
+    B -->|preprocess: 过滤与文本编码| C[W/downstream/D/]
+    C -->|train.inter + feat1CLS + feat2CLS| P[pretrain]
+    P --> X[W/checkpoints/pretrain/*.pth]
+    C -->|train / valid / test.inter + feat1CLS| F[finetune]
+    X --> F
+    F --> Y[W/checkpoints/finetune/UniSRec-D-finetuned.pth]
+    C --> R[predict]
+    Y --> R
+    M[商品品类 + 可推荐商品 CSV / ODPS] --> R
+    R --> Z[W/results/D-recommendations.csv]
+    R --> Q[W/results/D-details-date.csv]
+    R -. --output-table .-> O[可选 ODPS 结果表]
 ```
 
-| 阶段 | 读取 | 产出 |
-| --- | --- | --- |
-| `fetch` | ODPS `unisrec_raw_data` 的用户、商品、购买次数、日期和商品属性 | `W/raw/lianhua.csv` |
-| `preprocess` | 上述 CSV 和本地文本编码器；按配置过滤交互、按时间排序并编码商品属性 | `W/downstream/lianhua/` 下的 `lianhua.train.inter`、`lianhua.valid.inter`、`lianhua.test.inter`、`lianhua.feat1CLS`、`lianhua.feat2CLS`、`index2user.json`、`index2item.json` |
-| `pretrain` | `train.inter` 与两份商品文本向量 | `W/checkpoints/pretrain/` 下的 `.pth` 权重；Bash 输出本次权重路径 |
-| `finetune` | 预训练权重、训练/验证原子文件与 `feat1CLS`；同时加载测试原子文件 | `W/checkpoints/finetune/UniSRec-lianhua-finetuned.pth` |
-| `predict` | 微调权重、处理后的原子文件与 ID 映射；另从 ODPS 的 `unisrec_items_info` 读取商品品类，从 `lianhua_recall_station_brand_category_grade_base_tmp` 读取在售商品 | 本地预测明细 CSV；目标 ODPS 表中的 `user_id`、`prod_id`、`similarity_score` |
+图中 `D` 是 `--dataset` 的值。预训练和微调使用同一次预处理的数据。当前划分会先把全部交互放入训练序列，取末尾最多 50 个构造训练样本；验证和测试目标均为末次交互，并非独立留出集。预测从全量评分中最多取 800 个候选，按有效商品和品类筛选，最后每用户保留至多 `--top-k` 个；写推荐明细时仅保留历史序列最长的前 150000 名用户。这些规则属于当前业务逻辑。
 
-预训练和微调使用同一次预处理得到的 `lianhua` 数据。当前生产预处理先把用户的全部交互放入训练序列，再取末尾最多 50 个构造训练样本；验证和测试目标都取序列最后一次交互。这不是相互独立的留出划分。
-
-任一阶段失败，脚本立即停止。预测写表会删除已有的同名 ODPS 表并重建；默认表名是 `lianhua_tmp_Unisrec_uid2simitem`。首次运行前应确认目标表和凭据指向预期环境。
+`<dataset>-recommendations.csv` 和可选 ODPS 表采用相同的逐条推荐格式：`user_id,item_id,score`。`<dataset>-details-<date>.csv` 则用于检查预测，列为 `user_id,history_item_ids,target_item_id,recommended_item_ids,recommendation_scores`；其中列表列是 JSON 数组字符串。结果文件以当前数据集命名，不包含评估指标；命中率打印在日志中。
 
 ## 独立运行阶段
 
-所有阶段都通过 Bash 入口执行。单独运行时，上游产物需已存在于相同的 `--work-dir` 中；预训练完成后，命令会打印权重路径，供独立微调使用。
+每个阶段均通过 Bash 执行。上游阶段的文件应已存在于同一 `--work-dir`；`finetune` 需要预训练阶段打印的权重路径。以下命令以 CSV 为例：
 
 ```bash
-bash run.sh --stage fetch --work-dir /ml/output --env-file /ml/output/.env
-bash run.sh --stage preprocess --work-dir /ml/output --plm-path /path/to/local/bert-model
-bash run.sh --stage pretrain --work-dir /ml/output
-bash run.sh --stage finetune --work-dir /ml/output --pretrained-checkpoint /path/to/pretrained.pth
-bash run.sh --stage predict --work-dir /ml/output --finetuned-checkpoint /ml/output/checkpoints/finetune/UniSRec-lianhua-finetuned.pth --env-file /ml/output/.env
+bash run.sh --stage fetch --dataset catalog --input-csv /path/to/interactions.csv
+bash run.sh --stage preprocess --dataset catalog --plm-path /path/to/text_encoder
+bash run.sh --stage pretrain --dataset catalog
+bash run.sh --stage finetune --dataset catalog --pretrained-checkpoint /path/to/pretrained.pth
+bash run.sh --stage predict --dataset catalog \
+  --item-metadata-csv /path/to/item_metadata.csv \
+  --eligible-items-csv /path/to/eligible_items.csv
 ```
 
-省略 `--stage` 时默认执行 `all`。`predict` 如果不传 `--finetuned-checkpoint`，会使用当前工作目录下的默认微调权重。`preprocess` 会生成预训练所需的两份文本向量。
+`predict` 默认从工作目录的 `checkpoints/finetune/` 读取相应数据集的权重，也可用 `--finetuned-checkpoint` 指定。任一阶段失败，完整流水线立即停止。

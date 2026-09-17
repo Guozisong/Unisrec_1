@@ -5,12 +5,12 @@ from recbole.trainer.trainer import PretrainTrainer
 from recbole.utils import init_seed, init_logger
 
 from unisrec import UniSRec
-from data.dataset import UniSRecDataset
-from data.dataloader import CustomizedTrainDataLoader
+from recbole_data.dataset import UniSRecDataset
+from recbole_data.dataloader import CustomizedTrainDataLoader
 
 
 def pretrain(dataset, **kwargs):
-    props = ['props/UniSRec.yaml', 'props/pretrain.yaml']
+    props = ['configs/UniSRec.yaml', 'configs/pretrain.yaml']
 
     config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=kwargs)
     init_seed(config['seed'], config['reproducibility'])
@@ -44,7 +44,7 @@ def pretrain(dataset, **kwargs):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', type=str, default='lianhua', help='dataset name')
+    parser.add_argument('-d', type=str, required=True, help='dataset name')
     parser.add_argument('--data-path', required=True, help='parent directory of the dataset')
     parser.add_argument('--checkpoint-dir', required=True)
     parser.add_argument('--checkpoint-path-file', required=True)

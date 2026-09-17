@@ -6,11 +6,11 @@ from recbole.data import data_preparation
 from recbole.utils import init_seed, get_trainer
 
 from unisrec import UniSRec
-from data.dataset import UniSRecDataset
+from recbole_data.dataset import UniSRecDataset
 
 def finetune(dataset, pretrained_file, fix_enc=True, **kwargs):
     # 配置文件
-    props = ['props/UniSRec.yaml', 'props/finetune.yaml']
+    props = ['configs/UniSRec.yaml', 'configs/finetune.yaml']
     print(props)
 
     # 配置初始化
@@ -54,7 +54,7 @@ def finetune(dataset, pretrained_file, fix_enc=True, **kwargs):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', type=str, default='lianhua', help='dataset name for training')
+    parser.add_argument('-d', type=str, required=True, help='dataset name for training')
     parser.add_argument('-p', type=str, required=True, help='pre-trained model path')
     parser.add_argument('--no-fix-encoder', action='store_false', dest='fix_enc')
     parser.add_argument('--data-path', required=True, help='parent directory of the dataset')
