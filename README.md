@@ -1,132 +1,91 @@
-# UniSRec_1 Project
+# UniSRec_1
 
-## 简介 (Introduction)
+基于 RecBole 和 PyTorch 的序列推荐项目。当前取数 SQL、商品筛选查询和默认输出表均针对 `lianhua`；模型支持预训练、微调和全量商品打分。
 
-本项目是一个基于 [RecBole](https://recbole.io/) 和 PyTorch 实现的通用序列推荐（Universal Sequence Recommendation, UniSRec）系统。项目支持模型的预训练（Pre-training）和微调（Fine-tuning），并针对特定数据集（如 `lianhua`）进行了适配。
-
-## 项目结构 (Project Structure)
+## 目录
 
 ```text
-UniSRec_1/
-├── config.py           # 配置加载逻辑
-├── finetune.py         # 模型微调入口脚本
-├── pretrain.py         # 模型预训练入口脚本
-├── predict.py          # 模型预测脚本
-├── unisrec.py          # UniSRec 模型定义
-├── data/               # 数据加载与处理核心逻辑
-│   ├── dataloader.py
-│   ├── dataset.py
-│   └── transform.py
-├── dataset/            # 数据集目录
-│   ├── downstream/     # 下游任务数据（处理后）
-│   ├── preprocessing/  # 数据预处理脚本 & BERT模型
-│   └── raw/            # 原始数据
-├── props/              # 配置文件目录
-│   ├── UniSRec.yaml    # 主配置文件
-│   ├── finetune.yaml   # 微调特定配置
-│   └── pretrain.yaml   # 预训练特定配置
-├── saved/              # 保存的模型权重 (.pth)
-└── wandb/              # Weights & Biases 日志
+run.sh                         完整流程与独立阶段入口
+dataset/raw/get_data_from_odps.py  从 ODPS 导出交互数据
+dataset/preprocessing/        清洗交互并生成商品文本向量
+data/                         RecBole 数据集、加载器和数据增强
+unisrec.py                    模型和损失函数
+pretrain.py                   预训练入口
+finetune.py                   微调入口
+predict.py                    预测和 ODPS 结果写入入口
+props/                        RecBole YAML 配置
+tests/                        流程入口测试
 ```
 
-## 环境要求 (Requirements)
+运行时数据和权重由 `--work-dir` 指定，不包含在仓库中。
 
-- Python 3.8+
-- PyTorch (建议 1.12+)
-- CUDA (如果使用 GPU)
+## 环境
 
-主要依赖库：
-- recbole
-- transformers
-- torch
-- wandb
-- pandas
-- numpy
-- tqdm
+需要 Python、PyTorch、RecBole、Transformers、PyODPS 和项目依赖。`requirements.txt` 中的 PyTorch 为 CUDA 11.6 构建；应在匹配的 Linux/CUDA 环境中安装。文本编码器模型需提前放在本地目录，默认目录为仓库下的 `bert-base-uncased/`。ODPS 凭据文件默认位于 `/ml/output/.env`，使用 `ALI_ACCESS_ID` 和 `ALI_SECRET_ACCESS_KEY`。
 
-## 安装说明 (Installation)
-
-1.  **克隆项目**
-    ```bash
-    git clone <repository_url>
-    cd UniSRec_1
-    ```
-
-2.  **创建并激活虚拟环境 (推荐)**
-    ```bash
-    conda create -n unisrec python=3.9
-    conda activate unisrec
-    ```
-
-3.  **安装依赖**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(注意：如果根目录下没有 `requirements.txt`，请参考 `wandb` 目录下的日志文件或手动安装上述核心依赖)*
-
-## 数据准备 (Data Preparation)
-
-原始数据应放置在 `dataset/raw/` 目录下。
-
-数据预处理脚本位于 `dataset/preprocessing/process_or.py`。该脚本负责加载原始数据（如 `lianhua.csv`），执行 K-core 过滤，生成文本特征，并转换为模型所需的原子文件格式。
-
-**运行预处理：**
+## 完整流程
 
 ```bash
-cd dataset/preprocessing
-python process_or.py --dataset lianhua --input_path ../raw/
+bash run.sh \
+  --stage all \
+  --dataset lianhua \
+  --work-dir /ml/output \
+  --plm-path /path/to/local/bert-model \
+  --env-file /ml/output/.env \
+  --python python3 \
+  --top-k 50
 ```
 
-参数说明：
-- `--dataset`: 数据集名称
-- `--user_k_min`: 用户最少交互数过滤阈值
-- `--item_k`: 商品最少被交互数过滤阈值
-- `--input_path`: 原始数据路径
+查看参数：`bash run.sh --help`。目前完整流程只支持 `lianhua` 数据源。命令会依次：
 
-## 配置说明 (Configuration)
+1. 从 ODPS 导出近期交互到 `<work-dir>/raw/lianhua.csv`（日期范围以取数 SQL 为准）。
+2. 过滤交互、生成训练/验证/测试原子文件，以及 `feat1CLS` 和 `feat2CLS` 商品文本向量，保存在 `<work-dir>/downstream/lianhua/`。
+3. 用该数据预训练，权重保存在 `<work-dir>/checkpoints/pretrain/`，并将本次保存的模型传给微调。
+4. 加载预训练权重进行微调，保存到 `<work-dir>/checkpoints/finetune/UniSRec-lianhua-finetuned.pth`。
+5. 将预测 CSV 保存到 `<work-dir>/results/`，并写入 `--output-table` 指定的 ODPS 表。
 
-项目使用 YAML 文件进行配置，主要位于 `props/` 目录下：
+## 数据流与阶段交接
 
-- **`props/UniSRec.yaml`**: 包含模型架构参数（如 `hidden_size`, `n_layers`）、训练参数（`epochs`, `batch_size`）等通用配置。
-- **`props/finetune.yaml`**: 微调阶段特定的配置。
-- **`props/pretrain.yaml`**: 预训练阶段特定的配置。
+以下用 `W` 表示 `--work-dir`。`--stage all` 按图中顺序执行；独立运行阶段时，从已有的上游文件继续。
 
-可以在运行脚本时通过命令行参数覆盖部分配置，或者直接修改 YAML 文件。
+```mermaid
+flowchart LR
+    A[ODPS: unisrec_raw_data] -->|fetch| B[W/raw/lianhua.csv]
+    B -->|preprocess| C[W/downstream/lianhua/]
+    C -->|train.inter + feat1CLS + feat2CLS| D[pretrain]
+    D --> E[W/checkpoints/pretrain/*.pth]
+    C -->|train/valid/test.inter + feat1CLS| F[finetune]
+    E --> F
+    F --> G[W/checkpoints/finetune/UniSRec-lianhua-finetuned.pth]
+    C -->|test.inter + ID 映射 + feat1CLS| H[predict]
+    G --> H
+    I[ODPS: 商品品类表和在售商品表] --> H
+    H --> J[W/results/predict_result-*.csv]
+    H --> K[ODPS: --output-table]
+```
 
-## 使用说明 (Usage)
+| 阶段 | 读取 | 产出 |
+| --- | --- | --- |
+| `fetch` | ODPS `unisrec_raw_data` 的用户、商品、购买次数、日期和商品属性 | `W/raw/lianhua.csv` |
+| `preprocess` | 上述 CSV 和本地文本编码器；按配置过滤交互、按时间排序并编码商品属性 | `W/downstream/lianhua/` 下的 `lianhua.train.inter`、`lianhua.valid.inter`、`lianhua.test.inter`、`lianhua.feat1CLS`、`lianhua.feat2CLS`、`index2user.json`、`index2item.json` |
+| `pretrain` | `train.inter` 与两份商品文本向量 | `W/checkpoints/pretrain/` 下的 `.pth` 权重；Bash 输出本次权重路径 |
+| `finetune` | 预训练权重、训练/验证原子文件与 `feat1CLS`；同时加载测试原子文件 | `W/checkpoints/finetune/UniSRec-lianhua-finetuned.pth` |
+| `predict` | 微调权重、处理后的原子文件与 ID 映射；另从 ODPS 的 `unisrec_items_info` 读取商品品类，从 `lianhua_recall_station_brand_category_grade_base_tmp` 读取在售商品 | 本地预测明细 CSV；目标 ODPS 表中的 `user_id`、`prod_id`、`similarity_score` |
 
-### 1. 模型预训练 (Pre-training)
+预训练和微调使用同一次预处理得到的 `lianhua` 数据。当前生产预处理先把用户的全部交互放入训练序列，再取末尾最多 50 个构造训练样本；验证和测试目标都取序列最后一次交互。这不是相互独立的留出划分。
 
-使用 `pretrain.py` 脚本进行模型预训练。
+任一阶段失败，脚本立即停止。预测写表会删除已有的同名 ODPS 表并重建；默认表名是 `lianhua_tmp_Unisrec_uid2simitem`。首次运行前应确认目标表和凭据指向预期环境。
+
+## 独立运行阶段
+
+所有阶段都通过 Bash 入口执行。单独运行时，上游产物需已存在于相同的 `--work-dir` 中；预训练完成后，命令会打印权重路径，供独立微调使用。
 
 ```bash
-python pretrain.py -d lianhua
+bash run.sh --stage fetch --work-dir /ml/output --env-file /ml/output/.env
+bash run.sh --stage preprocess --work-dir /ml/output --plm-path /path/to/local/bert-model
+bash run.sh --stage pretrain --work-dir /ml/output
+bash run.sh --stage finetune --work-dir /ml/output --pretrained-checkpoint /path/to/pretrained.pth
+bash run.sh --stage predict --work-dir /ml/output --finetuned-checkpoint /ml/output/checkpoints/finetune/UniSRec-lianhua-finetuned.pth --env-file /ml/output/.env
 ```
 
-- `-d`: 指定数据集名称（默认为 `lianhua`）。
-
-### 2. 模型微调 (Fine-tuning)
-
-使用 `finetune.py` 脚本加载预训练模型并进行微调。
-
-```bash
-python finetune.py -d lianhua -p ./saved/UniSRec-LIANHUA-6.pth
-```
-
-- `-d`: 指定数据集名称。
-- `-p`: 指定预训练模型的路径（`.pth` 文件）。
-- `-f`: 是否固定编码器参数 (True/False)。
-
-### 3. 模型预测 (Prediction)
-
-使用 `predict.py` 进行推理（具体用法请参考脚本实现）。
-
-## 结果与日志 (Results & Logs)
-
-- **模型权重**: 训练好的模型会保存在 `saved/` 目录下。
-- **日志**: 训练日志和指标通过 `wandb` 记录，保存在 `wandb/` 目录下，也可在控制台查看。
-
-## 常见问题 (FAQ)
-
-- **OOM (Out of Memory)**: 如果遇到显存不足，请在 `props/UniSRec.yaml` 中减小 `batch_size` 或 `MAX_ITEM_LIST_LENGTH`。
-- **数据路径错误**: 请确保 `dataset/` 下的目录结构符合预期，且配置文件中的数据路径正确。
+省略 `--stage` 时默认执行 `all`。`predict` 如果不传 `--finetuned-checkpoint`，会使用当前工作目录下的默认微调权重。`preprocess` 会生成预训练所需的两份文本向量。

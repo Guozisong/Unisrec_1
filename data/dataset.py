@@ -20,7 +20,8 @@ class UniSRecDataset(SequentialDataset):
 
     # self.field2id_token['item_id']：整数ID到原始值的映射
     def load_plm_embedding1(self):
-        feat_path = osp.join(self.config['data_path'], f'{self.dataset_name}.{self.plm_suffix}')
+        feat_path = osp.join(self.config['data_path'], self.dataset_name,
+                             f'{self.dataset_name}.{self.plm_suffix}')
         loaded_feat = np.fromfile(feat_path, dtype=np.float32).reshape(-1, self.plm_size)
 
         mapped_feat = np.zeros((self.item_num, self.plm_size))
@@ -30,7 +31,8 @@ class UniSRecDataset(SequentialDataset):
         return mapped_feat
 
     def load_plm_embedding2(self):
-        feat_path = osp.join(self.config['data_path'], f'{self.dataset_name}.{self.plm_suffix_aug}')
+        feat_path = osp.join(self.config['data_path'], self.dataset_name,
+                             f'{self.dataset_name}.{self.plm_suffix_aug}')
         loaded_feat = np.fromfile(feat_path, dtype=np.float32).reshape(-1, self.plm_size)
 
         mapped_feat = np.zeros((self.item_num, self.plm_size))

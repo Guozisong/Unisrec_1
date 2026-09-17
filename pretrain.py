@@ -10,11 +10,8 @@ from data.dataloader import CustomizedTrainDataLoader
 
 
 def pretrain(dataset, **kwargs):
-    # configurations initialization
     props = ['props/UniSRec.yaml', 'props/pretrain.yaml']
-    print(props)
 
-    # configurations initialization
     config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=kwargs)
     init_seed(config['seed'], config['reproducibility'])
     # logger initialization
@@ -42,15 +39,18 @@ def pretrain(dataset, **kwargs):
     # 模型训练
     trainer.pretrain(pretrain_data, show_progress=True)
 
-    return config['model'], config['dataset']
+    return config['model'], config['dataset'], trainer.saved_model_file
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', type=str, default='lianhua', help='dataset name')
-    args, unparsed = parser.parse_known_args()
+    parser.add_argument('--data-path', required=True, help='parent directory of the dataset')
+    parser.add_argument('--checkpoint-dir', required=True)
+    parser.add_argument('--checkpoint-path-file', required=True)
+    args = parser.parse_args()
 
-    model, dataset = pretrain(args.d)
-
-
-
+    model, dataset, checkpoint = pretrain(args.d, data_path=args.data_path,
+                                          checkpoint_dir=args.checkpoint_dir)
+    with open(args.checkpoint_path_file, 'w') as file:
+        file.write(checkpoint)

@@ -46,6 +46,7 @@ pydantic_core==2.33.1
 pyodps==0.12.2.2
 pyparsing==3.2.3
 python-dateutil==2.9.0.post0
+python-dotenv
 pytz==2025.2
 PyYAML==6.0.2
 ray==2.6.3

@@ -17,7 +17,7 @@
 | **商品表示** | **纯文本特征 (PLM)**。利用 BERT 等模型提取的通用文本向量 (`plm_emb`)。 | **PLM + ID Embedding**。在 Transductive 模式下，结合 PLM 特征和领域特定的 Item ID Embedding。 |
 | **ID 映射** | **跨域映射**。需要处理 `iid2domain`，记录商品所属的域。 | **域内映射**。标准的序列推荐 ID 映射。 |
 | **输入 X** | 原始序列 (`item_seq`) + **增强序列** (`item_seq_aug`)。 | 仅原始序列 (`item_seq`)。 |
-| **数据加载类** | `PretrainUniSRecDataset` | `UniSRecDataset` |
+| **数据加载类** | `UniSRecDataset`（通过预训练配置加载增强特征） | `UniSRecDataset` |
 
 ## 3. 优化目标与损失函数 (Optimization Objectives)
 
@@ -58,11 +58,6 @@
 
 ## 5. 代码实现参考 (Code References)
 
-*   **数据集定义**: `data/dataset.py`
-    *   [UniSRecDataset](file:///p:/pycharm_workSpace/UniSRec_1/data/dataset.py#L8) (微调)
-    *   [PretrainUniSRecDataset](file:///p:/pycharm_workSpace/UniSRec_1/data/dataset.py#L49) (预训练)
-*   **数据增强**: `data/transform.py`
-    *   [PLMEmb](file:///p:/pycharm_workSpace/UniSRec_1/data/transform.py#L28) (实现 Item Drop / Word Drop)
-*   **模型与损失**: `unisrec.py`
-    *   [pretrain](file:///p:/pycharm_workSpace/UniSRec_1/unisrec.py#L140) (预训练损失计算)
-    *   [calculate_loss](file:///p:/pycharm_workSpace/UniSRec_1/unisrec.py#L159) (微调损失计算)
+*   **数据集定义**: [`UniSRecDataset`](data/dataset.py)
+*   **数据增强**: [`PLMEmb`](data/transform.py)（Item Drop / Word Drop）
+*   **模型与损失**: [`UniSRec`](unisrec.py)（预训练对比损失与微调交叉熵损失）

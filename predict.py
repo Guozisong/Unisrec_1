@@ -14,17 +14,21 @@ from odps import ODPS
 from odps.models import Schema, Column
 from dotenv import load_dotenv
 
-def write_to_odps(df1):
+def connect_odps(env_file):
     # 建立链接。
-    load_dotenv("/ml/output/.env")
+    load_dotenv(env_file, override=True)
     access_id = os.getenv("ALI_ACCESS_ID")
     access_key = os.getenv("ALI_SECRET_ACCESS_KEY")
+    if not access_id or not access_key:
+        raise ValueError('ODPS credentials are missing from the environment file')
     project = 'jxaidataworks'
     endpoint = 'https://service.cn-hangzhou-vpc.maxcompute.aliyun-inc.com/api'
 
-    odps = ODPS(access_id, access_key, project, endpoint=endpoint)
-    
-    table_name1 = 'lianhua_tmp_Unisrec_uid2simitem'
+    return ODPS(access_id, access_key, project, endpoint=endpoint)
+
+
+def write_to_odps(df1, env_file, table_name1):
+    odps = connect_odps(env_file)
 
     columns = [
         Column(name='user_id', type='string', comment='用户索引'),
@@ -39,24 +43,15 @@ def write_to_odps(df1):
         print(f"Table {table_name1} has been dropped.")
   
     odps.create_table(table_name1, schema, if_not_exists=True)
-    print(f"Table {table_name1} already exists.")
-
-    table = odps.get_table(table_name1)
+    print(f"Table {table_name1} has been created.")
 
     # 将DataFrame写入ODPS表
     odps.write_table(table_name1, df1, overwrite=True)
 
     print(f"Data has been written to {table_name1}")
 
-def read_from_odps():
-    load_dotenv("/ml/output/.env")
-    access_id = os.getenv("ALI_ACCESS_ID")
-    access_key = os.getenv("ALI_SECRET_ACCESS_KEY")
-    project = 'jxaidataworks'
-    endpoint = 'https://service.cn-hangzhou-vpc.maxcompute.aliyun-inc.com/api'
-
-    # 初始化ODPS对象
-    odps = ODPS(access_id, access_key, project, endpoint)
+def read_from_odps(env_file):
+    odps = connect_odps(env_file)
 
     # 商品品类
     sql_1 = '''SELECT prod_id, cate_level5_code FROM unisrec_items_info;'''
@@ -76,7 +71,7 @@ def read_from_odps():
 def diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=10, top_k=50):
     # 建立 prod_id -> cate_id 映射字典
     prod2cate = dict(zip(prod_cate_info['prod_id'], prod_cate_info['cate_level5_code']))
-    valid_prod = valid_prod['prod_id'].to_list() 
+    valid_prod = set(valid_prod['prod_id'].to_list())
 
     diversified_items = [] 
     diversified_scores = []
@@ -120,18 +115,21 @@ def _full_sort_batch_eval(batched_data, model, device, tot_item_num):
     return interaction, scores, positive_u, positive_i
 
 
-def predictor(dataset, model_file, top_k, result_save_path):
+def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
+              env_file='/ml/output/.env', output_table='lianhua_tmp_Unisrec_uid2simitem'):
     # 配置文件
     props = ['props/UniSRec.yaml', 'props/finetune.yaml']
-    config = Config(model=UniSRec, dataset=dataset, config_file_list=props)
+    overrides = {'data_path': data_path} if data_path else None
+    config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=overrides)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("加载数据 ...")
     dataset_ = UniSRecDataset(config)
     train_data, valid_data, test_data = data_preparation(config, dataset_)
 
-    with open(os.path.join(config["data_path"], "index2user.json"), 'r', encoding='utf-8') as f:
+    dataset_path = os.path.join(config["data_path"], dataset)
+    with open(os.path.join(dataset_path, "index2user.json"), 'r', encoding='utf-8') as f:
         index2user = json.load(f)
-    with open(os.path.join(config["data_path"], "index2item.json"), 'r', encoding='utf-8') as f:
+    with open(os.path.join(dataset_path, "index2item.json"), 'r', encoding='utf-8') as f:
         index2item = json.load(f)
 
     print("加载模型 ...")
@@ -168,8 +166,9 @@ def predictor(dataset, model_file, top_k, result_save_path):
             items_id_list = interaction[config["ITEM_ID_FIELD"] + config["LIST_SUFFIX"]] # 批次用户商品ID序列
             items_id = interaction[config["ITEM_ID_FIELD"]]  # 批次目标商品ID
             # 批次用户预测结果
-            topk_values = (torch.topk(scores, k=800, dim=1)[0]).cpu().numpy()
-            topk_idx = (torch.topk(scores, k=800, dim=1)[1]).cpu().numpy()
+            topk_values, topk_idx = torch.topk(scores, k=min(800, tot_item_num - 1), dim=1)
+            topk_values = topk_values.cpu().numpy()
+            topk_idx = topk_idx.cpu().numpy()
         
             # 用户、商品转换
             # 用户id转换
@@ -197,7 +196,7 @@ def predictor(dataset, model_file, top_k, result_save_path):
 
     
     # 推荐商品按照三级品类打散, 同一品类下的商品至多保留 n 个，且均为目前在售商品
-    prod_cate_info, valid_prod = read_from_odps()
+    prod_cate_info, valid_prod = read_from_odps(env_file)
     rec_items, rec_items_score = diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=2, top_k=top_k)
     n = len(users)
     m = 0
@@ -212,8 +211,9 @@ def predictor(dataset, model_file, top_k, result_save_path):
         "推荐商品得分": rec_items_score
     })
     
-    df.to_csv(os.path.join(result_save_path, "predict_result-{}-{}.csv".format(str(round(m/n, 4)), str(datetime.now().date()))), encoding='utf-8-sig', index=False)
-    print("已保存到OSS")
+    csv_path = os.path.join(result_save_path, "predict_result-{}-{}.csv".format(str(round(m/n, 4)), str(datetime.now().date())))
+    df.to_csv(csv_path, encoding='utf-8-sig', index=False)
+    print(f"已保存到 {csv_path}")
     # 购买序列长度前150000的用户
     n_users = [user for user, seq in sorted(zip(users, items_seq), key=lambda x: len(x[1]), reverse=True)[:150000]]
     
@@ -221,11 +221,13 @@ def predictor(dataset, model_file, top_k, result_save_path):
     rec_items_score = [[round(x, 6) for x in row] for row in rec_items_score]
     
     # 手动添加试验用户
-    n_users.append('2a13f1cb662a4c44854ca823eaa6ec75')
-    users.append('2a13f1cb662a4c44854ca823eaa6ec75') 
-    i = users.index("a7f4dc8da5164063b9decf3aff6958f9")
-    rec_items.append(rec_items[i])
-    rec_items_score.append(rec_items_score[i])
+    source_user = 'a7f4dc8da5164063b9decf3aff6958f9'
+    if source_user in users:
+        n_users.append('2a13f1cb662a4c44854ca823eaa6ec75')
+        i = users.index(source_user)
+        users.append('2a13f1cb662a4c44854ca823eaa6ec75')
+        rec_items.append(rec_items[i])
+        rec_items_score.append(rec_items_score[i])
 
     n_users = list(set(n_users))
      
@@ -236,15 +238,20 @@ def predictor(dataset, model_file, top_k, result_save_path):
         for item, score in zip(items, scores):
             data.append([user, item, score])
     df1 = pd.DataFrame(data, columns=['user_id', 'prod_id', 'similarity_score'])
-    write_to_odps(df1) 
+    write_to_odps(df1, env_file, output_table)
     print("已保存到Dataworks")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', type=str, default='lianhua', help='dataset name')
-    parser.add_argument('-fp', type=str, default='/ml/output/UniSRec-lianhua-finetuned.pth', help='finetuned model path')
-    parser.add_argument('-t', type=str, default=50, help='top k scoring items')
+    parser.add_argument('-fp', type=str, required=True, help='finetuned model path')
+    parser.add_argument('-t', type=int, default=50, help='top k scoring items')
     parser.add_argument('-sp', type=str, default='/ml/output/result/', help= 'result save path')
-    args, unparsed = parser.parse_known_args()
+    parser.add_argument('--data-path', help='parent directory of the dataset')
+    parser.add_argument('--env-file', default='/ml/output/.env')
+    parser.add_argument('--output-table', default='lianhua_tmp_Unisrec_uid2simitem')
+    args = parser.parse_args()
+    if args.t < 1:
+        parser.error('-t must be a positive integer')
 
-    predictor(args.d, args.fp, args.t, args.sp)
+    predictor(args.d, args.fp, args.t, args.sp, args.data_path, args.env_file, args.output_table)

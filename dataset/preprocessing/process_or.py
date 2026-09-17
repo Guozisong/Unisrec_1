@@ -35,7 +35,7 @@ def preprocess_rating(args):
     print(' Dataset: ', args.dataset)
 
     # load ratings
-    rating_file_path = os.path.join(args.input_path, 'lianhua.csv')
+    rating_file_path = os.path.join(args.input_path, f'{args.dataset}.csv')
     rating_users, rating_items, rating_inters = load_ratings(rating_file_path)
 
     # 1. Filter items w/o meta data;
@@ -56,7 +56,7 @@ def preprocess_rating(args):
 def generate_text(args, items):
     item_text_list = []
 
-    meta_file_path = os.path.join(args.input_path, 'lianhua.csv')
+    meta_file_path = os.path.join(args.input_path, f'{args.dataset}.csv')
     item2text = {}
     with open(meta_file_path, 'r', encoding='utf-8') as fp:
         fp.readline()
@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument('--input_path', type=str, default='/ml/output/raw/')
     parser.add_argument('--output_path', type=str, default='/ml/output/downstream/')
     parser.add_argument('--gpu_id', type=int, default=0, help='ID of running GPU')
-    parser.add_argument('--plm_name', type=str, default='bert-base-chinese')
+    parser.add_argument('--plm_name', type=str, default='./bert-base-uncased/')
     parser.add_argument('--emb_type', type=str, default='CLS', help='item text emb type, can be CLS or Mean')
     parser.add_argument('--word_drop_ratio', type=float, default=-1, help='word drop ratio, do not drop by default')
 
@@ -162,7 +162,10 @@ def main(args):
 
     # 使用模型对所有商品描述文本进行embedding编码(编码向量行索引为商品编码)并保存  Embeddings shape: (商品数量, 编码维度)
     generate_item_embedding(args, item_text_list, item2index,
-                            plm_tokenizer, plm_model, word_drop_ratio=args.word_drop_ratio)
+                            plm_tokenizer, plm_model)
+    if args.word_drop_ratio > 0:
+        generate_item_embedding(args, item_text_list, item2index,
+                                plm_tokenizer, plm_model, word_drop_ratio=args.word_drop_ratio)
 
     # 训练、验证、测试集构建并保存
     convert_to_atomic_files(args, train_inters, valid_inters, test_inters)

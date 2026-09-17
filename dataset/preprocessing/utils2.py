@@ -17,8 +17,7 @@ def set_device(gpu_id):
 
 
 def load_plm(model_name='bert-base-uncased'):
-    tokenizer = AutoTokenizer.from_pretrained("./bert-base-uncased/")
-    model = AutoModel.from_pretrained("./bert-base-uncased/")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
     return tokenizer, model
-
 
