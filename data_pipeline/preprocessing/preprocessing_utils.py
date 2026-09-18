@@ -1,21 +1,7 @@
 import collections
-import gzip
-import html
-import json
 import os
 import random
-import re
 import torch
-from tqdm import tqdm
-
-
-def load_meta_items(file):
-    items = set()
-    with gzip.open(file, 'r') as fp:
-        for line in tqdm(fp, desc='Load metas'):
-            data = json.loads(line)
-            items.add(data['asin'])
-    return items
 
 
 def get_user2count(inters):
@@ -32,7 +18,6 @@ def get_item2count(inters):
     return item2count
 
 
-
 def generate_candidates(unit2count, threshold_min, threshold_max=100000000):
     cans = set()
     for unit, count in unit2count.items():
@@ -41,18 +26,9 @@ def generate_candidates(unit2count, threshold_min, threshold_max=100000000):
     return cans, len(unit2count) - len(cans)
 
 
-def filter_inters(inters, can_items=None, user_k_core_threshold_min=0,
+def filter_inters(inters, user_k_core_threshold_min=0,
                   user_k_core_threshold_max=0, item_k_core_threshold=0):
     new_inters = []
-    # filter by meta items
-    if can_items:
-        print('\nFiltering by meta items: ')
-        for unit in inters:
-            if unit[1] in can_items:
-                new_inters.append(unit)
-        inters, new_inters = new_inters, []
-        print('    The number of inters: ', len(inters))
-
     # filter by k-core
     if user_k_core_threshold_min or user_k_core_threshold_max or item_k_core_threshold:
         print('\nFiltering by k-core:')
@@ -95,59 +71,6 @@ def make_inters_in_order(inters):
     return new_inters
 
 
-def get_user_item_from_ratings(ratings):
-    users, items = set(), set()
-    for line in ratings:
-        user, item, rating, time = line
-        users.add(user)
-        items.add(item)
-    return users, items
-
-
-def clean_text(raw_text):
-    if isinstance(raw_text, list):
-        cleaned_text = ' '.join(raw_text)
-    elif isinstance(raw_text, dict):
-        cleaned_text = str(raw_text)
-    else:
-        cleaned_text = raw_text
-    cleaned_text = html.unescape(cleaned_text)
-    cleaned_text = re.sub(r'["\n\r]*', '', cleaned_text)
-    index = -1
-    while -index < len(cleaned_text) and cleaned_text[index] == '.':
-        index -= 1
-    index += 1
-    if index == 0:
-        cleaned_text = cleaned_text + '.'
-    else:
-        cleaned_text = cleaned_text[:index] + '.'
-    if len(cleaned_text) >= 2000:
-        cleaned_text = ''
-    return cleaned_text
-
-
-def load_text(file):
-    item_text_list = []
-    with open(file, 'r') as fp:
-        fp.readline()
-        for line in fp:
-            try:
-                item, text = line.strip().split('\t', 1)
-            except ValueError:
-                item = line.strip()
-                text = '.'
-            item_text_list.append([item, text])
-    return item_text_list
-
-
-def write_text_file(item_text_list, file):
-    print('Writing text file: ')
-    with open(file, 'w') as fp:
-        fp.write('item_id:token\ttext:token_seq\n')
-        for item, text in item_text_list:
-            fp.write(item + '\t' + text + '\n')
-
-
 def convert_inters2dict(inters):
     user2items = collections.defaultdict(list)
     user2index, item2index = dict(), dict()
@@ -167,30 +90,14 @@ def generate_training_data(args, rating_inters):
 
     # generate train valid test
     user2items, user2index, item2index = convert_inters2dict(rating_inters)
-    train_inters, valid_inters, test_inters = dict(), dict(), dict()
+    train_inters, valid_inters, test_inters, predict_inters = dict(), dict(), dict(), dict()
     for u_index in range(len(user2index)):
-        inters = user2items[u_index]
-        # leave one out
-        train_inters[u_index] = [str(i_index) for i_index in inters]
-        valid_inters[u_index] = [str(inters[-1])]
+        inters = user2items[u_index][-args.max_seq_length:]
+        train_inters[u_index] = [str(i_index) for i_index in inters[:-2]]
+        valid_inters[u_index] = [str(inters[-2])]
         test_inters[u_index] = [str(inters[-1])]
-        assert len(user2items[u_index]) == len(train_inters[u_index])
-    return train_inters, valid_inters, test_inters, user2index, item2index
-
-
-def load_unit2index(file):
-    unit2index = dict()
-    with open(file, 'r') as fp:
-        for line in fp:
-            unit, index = line.strip().split('\t')
-            unit2index[unit] = int(index)
-    return unit2index
-
-
-def write_remap_index(unit2index, file):
-    with open(file, 'w') as fp:
-        for unit in unit2index:
-            fp.write(unit + '\t' + str(unit2index[unit]) + '\n')
+        predict_inters[u_index] = [str(i_index) for i_index in inters]
+    return train_inters, valid_inters, test_inters, predict_inters, user2index, item2index
 
 
 def generate_item_embedding(args, item_text_list, item2index, tokenizer, model, word_drop_ratio=-1):
@@ -250,33 +157,26 @@ def generate_item_embedding(args, item_text_list, item2index, tokenizer, model, 
 
 
 # {用户编号: [交互商品编号]}
-def convert_to_atomic_files(args, train_data, valid_data, test_data):
+def convert_to_atomic_files(args, train_data, valid_data, test_data, predict_data):
     print('Convert dataset: ')
     print(' Dataset: ', args.dataset, '\n')
     uid_list = list(train_data.keys())
     uid_list.sort(key=lambda t: int(t))
 
-    # 截取序列[-50:]用于构建模型训练集
     with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.train.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
             item_seq = train_data[uid]
             seq_len = len(item_seq)
-            
-            # 长度大于50的序列，只取时序上后50个商品序列用于构建训练数据
-            if seq_len > 50:
-                item_seq = train_data[uid][-50:]
-                seq_len = 50
-
             for target_idx in range(1, seq_len):
                 target_item = item_seq[-target_idx]
-                seq = item_seq[:-target_idx][-50:]
+                seq = item_seq[:-target_idx]
                 file.write(f'{uid}\t{" ".join(seq)}\t{target_item}\n')
 
     with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.valid.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
-            item_seq = train_data[uid][-50:][:-1]
+            item_seq = train_data[uid]
             target_item = valid_data[uid][0]
             file.write(f'{uid}\t{" ".join(item_seq)}\t{target_item}\n')
 
@@ -284,6 +184,13 @@ def convert_to_atomic_files(args, train_data, valid_data, test_data):
     with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.test.inter'), 'w') as file:
         file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
         for uid in uid_list:
-            item_seq = train_data[uid][-50:]
+            item_seq = train_data[uid] + valid_data[uid]
             target_item = test_data[uid][0]
             file.write(f'{uid}\t{" ".join(item_seq)}\t{target_item}\n')
+
+    # RecBole requires an item_id column; it is a placeholder for inference.
+    with open(os.path.join(args.output_path, args.dataset, f'{args.dataset}.predict.inter'), 'w') as file:
+        file.write('user_id:token\titem_id_list:token_seq\titem_id:token\n')
+        for uid in uid_list:
+            item_seq = predict_data[uid]
+            file.write(f'{uid}\t{" ".join(item_seq)}\t{item_seq[-1]}\n')

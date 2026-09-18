@@ -19,6 +19,7 @@ Options:
   --eligible-items-table NAME ODPS eligible item table for prediction
   --work-dir DIR       Raw data, processed data, checkpoints, and results (default: project outputs/)
   --plm-path DIR       Local text encoder directory (default: ./bert-base-uncased)
+  --max-seq-length N   Recent interactions retained per user in preprocess (default: 50; 3-100)
   --env-file FILE      ODPS connection file (default: project .env)
   --python EXECUTABLE  Python executable (default: python3)
   --top-k NUMBER       Number of recommended items (default: 50)
@@ -41,6 +42,7 @@ item_metadata_table=
 eligible_items_table=
 work_dir=$repo_dir/outputs
 plm_path=$repo_dir/bert-base-uncased
+max_seq_length=50
 env_file=$repo_dir/.env
 python=python3
 top_k=50
@@ -50,7 +52,7 @@ finetuned_checkpoint=
 
 while (($#)); do
   case "$1" in
-    --stage|--dataset|--input-csv|--input-table|--input-query-file|--item-metadata-csv|--eligible-items-csv|--item-metadata-table|--eligible-items-table|--work-dir|--plm-path|--env-file|--python|--top-k|--output-table|--pretrained-checkpoint|--finetuned-checkpoint)
+    --stage|--dataset|--input-csv|--input-table|--input-query-file|--item-metadata-csv|--eligible-items-csv|--item-metadata-table|--eligible-items-table|--work-dir|--plm-path|--max-seq-length|--env-file|--python|--top-k|--output-table|--pretrained-checkpoint|--finetuned-checkpoint)
       if (($# < 2)); then echo "Missing value for $1" >&2; exit 2; fi
       case "$1" in
         --stage) stage=$2 ;;
@@ -64,6 +66,7 @@ while (($#)); do
         --eligible-items-table) eligible_items_table=$2 ;;
         --work-dir) work_dir=$2 ;;
         --plm-path) plm_path=$2 ;;
+        --max-seq-length) max_seq_length=$2 ;;
         --env-file) env_file=$2 ;;
         --python) python=$2 ;;
         --top-k) top_k=$2 ;;
@@ -110,6 +113,10 @@ if [[ "$stage" == all || "$stage" == predict ]]; then
 fi
 if [[ ! "$top_k" =~ ^[1-9][0-9]*$ ]]; then
   echo "--top-k must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$max_seq_length" =~ ^[0-9]+$ ]] || ((10#$max_seq_length < 3 || 10#$max_seq_length > 100)); then
+  echo "--max-seq-length must be an integer from 3 to 100" >&2
   exit 2
 fi
 if ! command -v "$python" >/dev/null 2>&1; then
@@ -190,7 +197,8 @@ preprocess() {
   fi
   mkdir -p "$data_dir"
   "$python" data_pipeline/preprocessing/preprocess.py --dataset "$dataset" --input_path "$raw_dir" \
-    --output_path "$data_dir" --plm_name "$plm_path" --word_drop_ratio 0.2
+    --output_path "$data_dir" --plm_name "$plm_path" --word_drop_ratio 0.2 \
+    --max_seq_length "$max_seq_length"
 }
 
 check_data() {
@@ -206,7 +214,6 @@ pretrain() {
   check_data train.inter feat1CLS feat2CLS
   mkdir -p "$pretrain_dir"
   checkpoint_path_file=$(mktemp "$work_dir/.pretrain-path.XXXXXX")
-  trap 'rm -f "$checkpoint_path_file"' EXIT
   "$python" pretrain.py -d "$dataset" --data-path "$data_dir" --checkpoint-dir "$pretrain_dir" \
     --checkpoint-path-file "$checkpoint_path_file"
   if [[ ! -s "$checkpoint_path_file" ]]; then
@@ -218,6 +225,8 @@ pretrain() {
     echo "Pretraining checkpoint does not exist: $pretrained_file" >&2
     exit 1
   fi
+  rm -f "$checkpoint_path_file"
+  checkpoint_path_file=
   echo "Pretrained checkpoint: $pretrained_file"
 }
 
@@ -237,7 +246,7 @@ finetune() {
 
 predict() {
   local checkpoint=$1
-  check_data train.inter valid.inter test.inter feat1CLS
+  check_data train.inter valid.inter predict.inter feat1CLS
   if [[ ! -f "$data_dir/$dataset/index2user.json" || ! -f "$data_dir/$dataset/index2item.json" ]]; then
     echo "Prediction ID mapping files are missing in $data_dir/$dataset" >&2
     exit 1
@@ -255,11 +264,59 @@ predict() {
   "$python" predict.py -d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir" "${sources[@]}"
 }
 
+stage_info() {
+  case "$1" in
+    fetch)
+      local input=${input_csv:-${input_query_file:-$input_table}}
+      printf 'input=%s output=%s' "$input" "$raw_dir/$dataset.csv" ;;
+    preprocess)
+      printf 'input=%s output=%s max_seq_length=%s encoder=%s' \
+        "$raw_dir/$dataset.csv" "$data_dir/$dataset" "$max_seq_length" "$plm_path" ;;
+    pretrain)
+      printf 'input=%s output=%s' "$data_dir/$dataset" "$pretrain_dir" ;;
+    finetune)
+      printf 'input=%s checkpoint=%s output=%s' \
+        "$data_dir/$dataset" "$2" "$finetune_dir" ;;
+    predict)
+      printf 'input=%s checkpoint=%s output=%s' \
+        "$data_dir/$dataset/$dataset.predict.inter" "$2" "$result_dir" ;;
+  esac
+}
+
+current_stage=
+stage_started=0
+checkpoint_path_file=
+on_exit() {
+  local status=$1
+  if [[ -n "$checkpoint_path_file" ]]; then
+    rm -f "$checkpoint_path_file"
+  fi
+  if ((status != 0)) && [[ -n "$current_stage" ]]; then
+    printf '[%s] stage=%s FAILED exit=%s elapsed=%ss\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S%z')" "$current_stage" "$status" "$((SECONDS - stage_started))" >&2
+  fi
+}
+trap 'on_exit $?' EXIT
+
+run_stage() {
+  current_stage=$1
+  shift
+  stage_started=$SECONDS
+  printf '[%s] stage=%s START dataset=%s work_dir=%s ' \
+    "$(date '+%Y-%m-%d %H:%M:%S%z')" "$current_stage" "$dataset" "$work_dir"
+  stage_info "$current_stage" "$@"
+  printf '\n'
+  "$current_stage" "$@"
+  printf '[%s] stage=%s COMPLETE elapsed=%ss\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S%z')" "$current_stage" "$((SECONDS - stage_started))"
+  current_stage=
+}
+
 case "$stage" in
-  all) fetch; preprocess; pretrain; finetune "$pretrained_file"; predict "$finetuned_file" ;;
-  fetch) fetch ;;
-  preprocess) preprocess ;;
-  pretrain) pretrain ;;
-  finetune) finetune "$pretrained_checkpoint" ;;
-  predict) predict "${finetuned_checkpoint:-$finetune_dir/UniSRec-${dataset}-finetuned.pth}" ;;
+  all) run_stage fetch; run_stage preprocess; run_stage pretrain; run_stage finetune "$pretrained_file"; run_stage predict "$finetuned_file" ;;
+  fetch) run_stage fetch ;;
+  preprocess) run_stage preprocess ;;
+  pretrain) run_stage pretrain ;;
+  finetune) run_stage finetune "$pretrained_checkpoint" ;;
+  predict) run_stage predict "${finetuned_checkpoint:-$finetune_dir/UniSRec-${dataset}-finetuned.pth}" ;;
 esac

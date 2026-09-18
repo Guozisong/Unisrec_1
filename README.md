@@ -1,6 +1,6 @@
 # UniSRec 序列推荐
 
-基于 RecBole、PyTorch 和商品文本向量的序列推荐流水线。数据集名称只用于文件和模型命名，不限定数据来源。通过 Bash 入口 `run.sh` 可以按顺序执行完整流程，也可以独立执行任一阶段。
+本项目基于 [RUCAIBox/UniSRec](https://github.com/RUCAIBox/UniSRec) 改造，使用 RecBole、PyTorch 和商品文本向量构建序列推荐流水线。数据集名称只用于文件和模型命名，不限定数据来源。通过 Bash 入口 `run.sh` 可以按顺序执行完整流程，也可以独立执行任一阶段。
 
 ## 项目结构
 
@@ -19,13 +19,13 @@ tests/                         入口及数据契约测试
 outputs/                       默认产物目录，由 Git 忽略
 ```
 
-`data_pipeline/preprocessing/legacy_preprocessing_utils.py` 是未被当前入口调用的历史划分实现。训练和预测的算法仍在相应脚本中；部署环境提供符合以下字段约定的输入。
+`data_pipeline/preprocessing/preprocessing_utils.py` 分别生成严格留出的训练评估序列和完整历史的生产预测序列。
 
 ## 数据契约
 
 ### 交互数据
 
-`fetch` 接收 CSV 文件、ODPS 表或 ODPS SQL 文件。统一后的 CSV 位于 `W/raw/<dataset>.csv`，其中 `W` 表示 `--work-dir`。字段如下，允许源文件有额外列且列顺序任意：
+`fetch` 接收 CSV 文件、ODPS 表或 ODPS SQL 文件。统一后的 CSV 位于 `W/raw/<dataset>.csv`，其中 `W` 表示 `--work-dir`。以下五列是本项目为数据接入定义的内部字段，**不是上游 UniSRec 要求的原始数据字段**；允许源文件有额外列且列顺序任意：
 
 | 字段 | 含义 | 格式示例 |
 | --- | --- | --- |
@@ -35,7 +35,7 @@ outputs/                       默认产物目录，由 Git 忽略
 | `event_time` | 交互日期；用于用户序列排序 | `2026-01-01` |
 | `item_text` | 文本编码器使用的商品描述 | `Item title and attributes` |
 
-历史 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式。预处理跳过这些字段中有空值的行；日期需要是 `YYYY-MM-DD`。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
+本项目早期 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式，无需修改原 ODPS 表。上游 UniSRec 的原始数据预处理因数据集而异；本项目预处理后生成的 RecBole 原子文件使用 `user_id`、`item_id_list`、`item_id` 等模型输入字段，以及商品文本向量文件。预处理跳过原始字段中有空值的行；日期需要是 `YYYY-MM-DD`。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
 
 ### 预测商品信息
 
@@ -63,7 +63,7 @@ endpoint=https://your-maxcompute-endpoint/api
 outputs/
 ├── raw/<dataset>.csv
 ├── downstream/<dataset>/
-│   ├── <dataset>.train.inter / .valid.inter / .test.inter
+│   ├── <dataset>.train.inter / .valid.inter / .test.inter / .predict.inter
 │   ├── <dataset>.feat1CLS / .feat2CLS
 │   └── index2user.json / index2item.json
 ├── checkpoints/pretrain/*.pth
@@ -99,6 +99,7 @@ bash run.sh --stage all --dataset catalog \
   --item-metadata-csv /path/to/item_metadata.csv \
   --eligible-items-csv /path/to/eligible_items.csv \
   --plm-path /path/to/text_encoder \
+  --max-seq-length 50 \
   --work-dir /path/to/work_dir
 ```
 
@@ -107,6 +108,8 @@ ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_tab
 查询文件必须返回交互数据契约中的五列，历史字段也受支持。需要原来的近期交互窗口时，可在 SQL 中继续使用日期条件。请审查实际 SQL 和 ODPS 目标表；写表时会删除已有同名表并重建。
 
 `bash run.sh --help` 列出所有参数。省略 `--stage` 等同于 `--stage all`。
+
+每个阶段开始时打印数据集、工作目录、主要输入和输出路径；完成时打印耗时。阶段失败时打印阶段名、退出码和耗时，完整流水线随即停止。日志不输出 `.env` 的凭据内容。
 
 迁移已有 ODPS 部署时，需要将原商品信息字段映射为 `item_id,category_id`，将可推荐商品字段映射为 `item_id`。可选结果表现在使用 `user_id,item_id,score`，原先依赖其他列名的下游任务需要同步调整。原来写死的试验用户复制规则已移除，推荐结果只包含真实输入用户。
 
@@ -121,7 +124,7 @@ flowchart LR
     C -->|train / valid / test.inter + feat1CLS| F[finetune]
     X --> F
     F --> Y[W/checkpoints/finetune/UniSRec-D-finetuned.pth]
-    C --> R[predict]
+    C -->|predict.inter + feat1CLS| R[predict]
     Y --> R
     M[商品品类 + 可推荐商品 CSV / ODPS] --> R
     R --> Z[W/results/D-recommendations.csv]
@@ -129,9 +132,9 @@ flowchart LR
     R -. --output-table .-> O[可选 ODPS 结果表]
 ```
 
-图中 `D` 是 `--dataset` 的值。预训练和微调使用同一次预处理的数据。当前划分会先把全部交互放入训练序列，取末尾最多 50 个构造训练样本；验证和测试目标均为末次交互，并非独立留出集。预测从全量评分中最多取 800 个候选，按有效商品和品类筛选，最后每用户保留至多 `--top-k` 个；写推荐明细时仅保留历史序列最长的前 150000 名用户。这些规则属于当前业务逻辑。
+图中 `D` 是 `--dataset` 的值。现有用户和商品交互次数过滤后，预处理对每位用户保留最近 `--max-seq-length` 次交互（默认 50，范围 3–100）。训练使用除最后两次外的交互，倒数第二次作为验证目标，最后一次作为测试目标；`predict.inter` 使用保留的完整序列供生产预测。预测从全量评分中最多取 800 个候选，按有效商品和品类筛选，最后每用户保留至多 `--top-k` 个；写推荐明细时仅保留历史序列最长的前 150000 名用户。这些规则属于当前业务逻辑。
 
-`<dataset>-recommendations.csv` 和可选 ODPS 表采用相同的逐条推荐格式：`user_id,item_id,score`。`<dataset>-details-<date>.csv` 则用于检查预测，列为 `user_id,history_item_ids,target_item_id,recommended_item_ids,recommendation_scores`；其中列表列是 JSON 数组字符串。结果文件以当前数据集命名，不包含评估指标；命中率打印在日志中。
+`<dataset>-recommendations.csv` 和可选 ODPS 表采用相同的逐条推荐格式：`user_id,item_id,score`。`<dataset>-details-<date>.csv` 则用于检查预测，列为 `user_id,history_item_ids,target_item_id,recommended_item_ids,recommendation_scores`；其中列表列是 JSON 数组字符串。生产预测没有已知目标商品，`target_item_id` 留空。结果文件以当前数据集命名。
 
 ## 各阶段 Bash 命令与参数
 
@@ -175,6 +178,7 @@ bash run.sh --stage preprocess \
   --dataset catalog \
   --work-dir "$WORK_DIR" \
   --plm-path /path/to/text_encoder \
+  --max-seq-length 50 \
   --python python3
 ```
 
@@ -183,6 +187,7 @@ bash run.sh --stage preprocess \
 | `--dataset NAME` | 必填；读取 `<work-dir>/raw/NAME.csv`，写入 `<work-dir>/downstream/NAME/`。 |
 | `--work-dir DIR` | 与 `fetch` 相同的工作目录；默认项目内 `outputs/`。 |
 | `--plm-path DIR` | 本地文本编码器目录；默认项目内 `bert-base-uncased/`。 |
+| `--max-seq-length N` | 每位用户保留最近 N 次交互，训练、验证、测试和生产预测均使用该窗口；默认 50，范围 3–100。 |
 | `--python EXECUTABLE` | Python 可执行文件；默认 `python3`。 |
 
 ### 3. pretrain：预训练
@@ -256,4 +261,4 @@ bash run.sh --stage predict --dataset catalog \
   --top-k 50 --work-dir "$WORK_DIR" --python python3
 ```
 
-`--stage all` 按以上顺序执行：需要 `--dataset`、一种交互来源、一种商品品类来源和一种可推荐商品来源；可指定 `--work-dir`、`--plm-path`、`--env-file`、`--python`、`--top-k`、`--output-table`。`--pretrained-checkpoint` 和 `--finetuned-checkpoint` 仅用于独立阶段，不能传给 `all`。任一阶段失败，完整流水线立即停止。
+`--stage all` 按以上顺序执行：需要 `--dataset`、一种交互来源、一种商品品类来源和一种可推荐商品来源；可指定 `--work-dir`、`--plm-path`、`--max-seq-length`、`--env-file`、`--python`、`--top-k`、`--output-table`。`--pretrained-checkpoint` 和 `--finetuned-checkpoint` 仅用于独立阶段，不能传给 `all`。任一阶段失败，完整流水线立即停止。

@@ -90,27 +90,19 @@ def diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_
 
     return diversified_items, diversified_scores
 
-def _full_sort_batch_eval(batched_data, model, device, tot_item_num):
-    interaction, history_index, positive_u, positive_i = batched_data
-
-    scores = model.full_sort_predict(interaction.to(device))
-
-    scores = scores.view(-1, tot_item_num)
-    scores[:, 0] = -np.inf
-    return interaction, scores, positive_u, positive_i
-
-
 def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
               env_file='.env', output_table=None, item_metadata_csv=None,
               eligible_items_csv=None, item_metadata_table=None, eligible_items_table=None):
     # 配置文件
     props = ['configs/UniSRec.yaml', 'configs/finetune.yaml']
-    overrides = {'data_path': data_path} if data_path else None
+    overrides = {'benchmark_filename': ['train', 'valid', 'predict']}
+    if data_path:
+        overrides['data_path'] = data_path
     config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=overrides)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("加载数据 ...")
     dataset_ = UniSRecDataset(config)
-    train_data, valid_data, test_data = data_preparation(config, dataset_)
+    _, _, test_data = data_preparation(config, dataset_)
 
     dataset_path = os.path.join(config["data_path"], dataset)
     with open(os.path.join(dataset_path, "index2user.json"), 'r', encoding='utf-8') as f:
@@ -126,31 +118,23 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
     model.eval()
 
     print("预测 ...")
-    eval_func = _full_sort_batch_eval
-    # item_tensor = test_data._dataset.get_item_feature().to(device)
     tot_item_num = test_data._dataset.item_num
-    iter_data = test_data
-    num_sample = 0
-    
-    if not os.path.exists(result_save_path):
-        os.makedirs(result_save_path)
+    os.makedirs(result_save_path, exist_ok=True)
 
     # 真实值
     users = []  # 用户
-    target_items = []  # 目标商品
     items_seq = [] # 商品序列（模型输入）
     rec_items = []  # 推荐商品 （模型输出）
     rec_items_score = []  # 推荐商品得分（模型输出）
     
     with torch.no_grad():
-        for batch_idx, batched_data in enumerate(iter_data):
-            num_sample += len(batched_data[0][config["USER_ID_FIELD"]])
-
-            interaction, scores, positive_u, positive_i = eval_func(batched_data, model, device, tot_item_num)
+        for batched_data in test_data:
+            interaction = batched_data[0]
+            scores = model.full_sort_predict(interaction.to(device)).view(-1, tot_item_num)
+            scores[:, 0] = -np.inf
 
             users_id = interaction[config["USER_ID_FIELD"]]  # 批次用户ID
             items_id_list = interaction[config["ITEM_ID_FIELD"] + config["LIST_SUFFIX"]] # 批次用户商品ID序列
-            items_id = interaction[config["ITEM_ID_FIELD"]]  # 批次目标商品ID
             # 批次用户预测结果
             topk_values, topk_idx = torch.topk(scores, k=min(800, tot_item_num - 1), dim=1)
             topk_values = topk_values.cpu().numpy()
@@ -160,9 +144,6 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
             # 用户id转换
             for user_id in users_id:
                 users.append(index2user[dataset_.field2id_token["user_id"][user_id]])
-            # 目标商品转换
-            for item_id in items_id:
-                target_items.append(index2item[dataset_.field2id_token["item_id"][item_id]])
             # 用户商品id序列转化
             for i in range(items_id_list.shape[0]):
                 T = []
@@ -195,34 +176,26 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
             frame[column] = frame[column].astype(str)
     rec_items, rec_items_score = diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=2, top_k=top_k)
     n = len(users)
-    m = 0
-    for i in range(len(users)):
-        if target_items[i] in rec_items[i]:
-            m += 1
     df = pd.DataFrame({
-        "用户": users,
-        "历史购买序列": items_seq,
-        "目标商品": target_items,
-        "推荐商品": rec_items,
-        "推荐商品得分": rec_items_score
+        'user_id': users,
+        'history_item_ids': items_seq,
+        'target_item_id': [None] * n,
+        'recommended_item_ids': rec_items,
+        'recommendation_scores': rec_items_score,
     })
     
     csv_path = os.path.join(result_save_path, f'{dataset}-details-{datetime.now().date()}.csv')
-    df.columns = ['user_id', 'history_item_ids', 'target_item_id', 'recommended_item_ids', 'recommendation_scores']
     for column in ('history_item_ids', 'recommended_item_ids', 'recommendation_scores'):
         df[column] = df[column].map(json.dumps)
     df.to_csv(csv_path, encoding='utf-8-sig', index=False)
     print(f"已保存到 {csv_path}")
-    print(f'Hit rate in saved details: {m / n:.4f}' if n else 'No prediction rows')
+    print(f'Prediction rows: {n}')
     # 购买序列长度前150000的用户
-    n_users = [user for user, seq in sorted(zip(users, items_seq), key=lambda x: len(x[1]), reverse=True)[:150000]]
+    n_users = {user for user, seq in sorted(zip(users, items_seq), key=lambda x: len(x[1]), reverse=True)[:150000]}
     
     data = []
     rec_items_score = [[round(x, 6) for x in row] for row in rec_items_score]
     
-    n_users = list(set(n_users))
-     
-
     for user, items, scores in zip(users, rec_items, rec_items_score):
         if user not in n_users:
             continue

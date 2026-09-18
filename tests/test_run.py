@@ -36,7 +36,7 @@ class PipelineTest(unittest.TestCase):
                 "elif stage == 'preprocess.py':\n"
                 "    path = pathlib.Path(value('--output_path')) / value('--dataset')\n"
                 "    path.mkdir(parents=True, exist_ok=True)\n"
-                "    for suffix in ('train.inter', 'valid.inter', 'test.inter', 'feat1CLS', 'feat2CLS'): (path / (value('--dataset') + '.' + suffix)).touch()\n"
+                "    for suffix in ('train.inter', 'valid.inter', 'test.inter', 'predict.inter', 'feat1CLS', 'feat2CLS'): (path / (value('--dataset') + '.' + suffix)).touch()\n"
                 "    for name in ('index2user.json', 'index2item.json'): (path / name).touch()\n"
                 "elif stage == 'pretrain.py':\n"
                 "    path = pathlib.Path(value('--checkpoint-dir')); path.mkdir(parents=True, exist_ok=True)\n"
@@ -52,7 +52,7 @@ class PipelineTest(unittest.TestCase):
                 ["bash", str(ROOT / "run.sh"), "--stage", "all", "--dataset", dataset, "--work-dir", str(work),
                  "--input-csv", str(input_csv), "--item-metadata-csv", str(metadata_csv),
                  "--eligible-items-csv", str(eligible_csv), "--plm-path", str(encoder),
-                 "--python", str(fake_python), "--top-k", "30"],
+                 "--python", str(fake_python), "--top-k", "30", "--max-seq-length", "40"],
                 cwd=work,
                 env={**os.environ, "STAGE_LOG": str(log)},
                 capture_output=True,
@@ -64,14 +64,20 @@ class PipelineTest(unittest.TestCase):
                 [Path(line.split()[0]).name for line in lines],
                 ["prepare_interactions.py", "preprocess.py", "pretrain.py", "finetune.py", "predict.py"],
             )
+            for stage_name in ('fetch', 'preprocess', 'pretrain', 'finetune', 'predict'):
+                self.assertIn(f'stage={stage_name} START dataset=sample work_dir={work}', result.stdout)
+                self.assertIn(f'stage={stage_name} COMPLETE elapsed=', result.stdout)
+            self.assertLess(result.stdout.index('stage=fetch COMPLETE'),
+                            result.stdout.index('stage=preprocess START'))
             self.assertIn(str(work / "downstream"), lines[2])
+            self.assertIn('--max_seq_length 40', lines[1])
             self.assertIn(str(work / "checkpoints" / "pretrain" / "pretrained.pth"), lines[3])
             self.assertIn(str(work / "checkpoints" / "finetune" / "UniSRec-sample-finetuned.pth"), lines[4])
             self.assertIn(str(metadata_csv), lines[4])
 
             single_stages = [
                 ("fetch", ["--input-csv", str(input_csv)], "prepare_interactions.py"),
-                ("preprocess", ["--plm-path", str(encoder)], "preprocess.py"),
+                ("preprocess", ["--plm-path", str(encoder), "--max-seq-length", "40"], "preprocess.py"),
                 ("pretrain", [], "pretrain.py"),
                 ("finetune", ["--pretrained-checkpoint", str(work / "checkpoints" / "pretrain" / "pretrained.pth")], "finetune.py"),
                 ("predict", ["--item-metadata-csv", str(metadata_csv), "--eligible-items-csv", str(eligible_csv), "--finetuned-checkpoint", str(work / "checkpoints" / "finetune" / "UniSRec-sample-finetuned.pth")], "predict.py"),
@@ -90,6 +96,19 @@ class PipelineTest(unittest.TestCase):
                     self.assertEqual(single.returncode, 0, single.stderr)
                     self.assertEqual([Path(line.split()[0]).name for line in log.read_text().splitlines()],
                                      [expected])
+                    self.assertIn(f'stage={stage} START', single.stdout)
+                    self.assertIn(f'stage={stage} COMPLETE', single.stdout)
+                    if stage == 'preprocess':
+                        self.assertIn('--max_seq_length 40', log.read_text())
+
+            invalid = subprocess.run(
+                ["bash", str(ROOT / "run.sh"), "--stage", "preprocess", "--dataset", dataset,
+                 "--work-dir", str(work), "--plm-path", str(encoder), "--python", str(fake_python),
+                 "--max-seq-length", "101"],
+                cwd=work, capture_output=True, text=True,
+            )
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn('--max-seq-length', invalid.stderr)
 
             log.write_text("")
             failed = subprocess.run(
@@ -102,8 +121,21 @@ class PipelineTest(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(failed.returncode, 12)
+            self.assertIn('stage=preprocess START', failed.stdout)
+            self.assertNotIn('stage=preprocess COMPLETE', failed.stdout)
+            self.assertIn('stage=preprocess FAILED exit=12', failed.stderr)
             self.assertEqual([Path(line.split()[0]).name for line in log.read_text().splitlines()],
                              ["prepare_interactions.py", "preprocess.py"])
+
+            failed_pretrain = subprocess.run(
+                ["bash", str(ROOT / "run.sh"), "--stage", "pretrain", "--dataset", dataset,
+                 "--work-dir", str(work), "--python", str(fake_python)],
+                cwd=work, env={**os.environ, "STAGE_LOG": str(log), "FAIL_STAGE": "pretrain.py"},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(failed_pretrain.returncode, 12)
+            self.assertIn('stage=pretrain FAILED exit=12', failed_pretrain.stderr)
+            self.assertEqual(list(work.glob('.pretrain-path.*')), [])
 
             env_file = work / '.env'
             env_file.touch()
