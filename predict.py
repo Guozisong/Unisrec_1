@@ -104,7 +104,7 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
     dataset_ = UniSRecDataset(config)
     _, _, test_data = data_preparation(config, dataset_)
 
-    dataset_path = os.path.join(config["data_path"], dataset)
+    dataset_path = config["data_path"]
     with open(os.path.join(dataset_path, "index2user.json"), 'r', encoding='utf-8') as f:
         index2user = json.load(f)
     with open(os.path.join(dataset_path, "index2item.json"), 'r', encoding='utf-8') as f:
