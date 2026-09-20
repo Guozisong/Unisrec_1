@@ -187,141 +187,345 @@ flowchart LR
 
 ## 各阶段 Bash 命令与参数
 
-所有阶段都执行 `bash run.sh --stage <阶段>`。`--dataset` 必填，只能由英文字母、数字和下划线组成，且必须以英文字母开头。`--work-dir` 对所有阶段可选，默认是项目内的 `outputs/`；独立执行时应保持一致。`--python` 对所有阶段可选，默认是 `python3`。`-h` 或 `--help` 显示 Bash 入口的参数列表。下面以 `WORK_DIR=/path/to/work_dir`、数据集 `catalog` 为例；将示例路径和表名替换为实际值。
-
-### 1. fetch：准备交互 CSV
+所有流程都通过 `bash run.sh` 执行。运行前可先定义公共路径，以下示例均使用这些变量：
 
 ```bash
+PROJECT_DIR=/path/to/Unisrec_1
 WORK_DIR=/path/to/work_dir
+PYTHON_BIN=/absolute/path/to/conda/envs/unisrec/bin/python3
 
+cd "$PROJECT_DIR"
+```
+
+### 公共约定
+
+| 参数 | 是否必填 | 默认值 | 含义与限制 |
+| --- | --- | --- | --- |
+| `--stage NAME` | 建议显式指定 | `all` | 可选值：`all`、`fetch`、`preprocess`、`pretrain`、`finetune`、`predict`。 |
+| `--dataset NAME` | 是 | 无 | 数据集标识，用于目录和文件命名。只能包含英文字母、数字、下划线，且必须以英文字母开头。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 全流程共享的工作目录。独立执行各阶段时必须使用同一目录。不存在时自动创建并转换为绝对路径。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行 Python 脚本的解释器。必须能被当前环境找到；使用 `nohup` 时建议传入 Conda 环境中的绝对路径。 |
+| `-h`、`--help` | 否 | 无 | 打印 `run.sh` 支持的全部 Bash 参数后退出。 |
+
+只有当前阶段表格中列出的参数才应传入该阶段。以下三项只能用于对应的独立阶段，传给其他阶段或 `all` 会直接报错：
+
+- `--resume-checkpoint`：仅用于 `pretrain`。
+- `--pretrained-checkpoint`：仅用于 `finetune`。
+- `--finetuned-checkpoint`：仅用于 `predict`。
+
+### 0. all：按顺序执行完整流水线
+
+执行顺序固定为：`fetch → preprocess → pretrain → finetune → predict`。任一阶段失败，后续阶段不会执行。
+
+#### CSV 输入示例
+
+```bash
+bash run.sh --stage all \
+  --dataset catalog \
+  --input-csv /path/to/interactions.csv \
+  --item-metadata-csv /path/to/item_metadata.csv \
+  --eligible-items-csv /path/to/eligible_items.csv \
+  --plm-path /path/to/text_encoder \
+  --max-seq-length 50 \
+  --top-k 50 \
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
+```
+
+#### 可执行参数
+
+| 参数 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--stage all` | 否 | `all` | 明确执行完整流水线。建议保留，便于阅读命令。 |
+| `--dataset NAME` | 是 | 无 | 全部阶段共用的数据集标识。 |
+| `--input-csv FILE` | 三选一 | 无 | 从已有交互 CSV 读取数据。必须与 `--input-table`、`--input-query-file` 三选一。 |
+| `--input-table NAME` | 三选一 | 无 | 读取 ODPS 交互表的全部行。必须与另外两种交互来源三选一。 |
+| `--input-query-file FILE` | 三选一 | 无 | 执行文件中的 ODPS SQL。适合日期过滤、字段别名和复杂查询。 |
+| `--item-metadata-csv FILE` | 二选一 | 无 | 商品品类 CSV，必须包含 `item_id,category_id`。与 `--item-metadata-table` 二选一。 |
+| `--item-metadata-table NAME` | 二选一 | 无 | ODPS 商品品类表。与 `--item-metadata-csv` 二选一。 |
+| `--eligible-items-csv FILE` | 二选一 | 无 | 可推荐商品 CSV，必须包含 `item_id`。与 `--eligible-items-table` 二选一。 |
+| `--eligible-items-table NAME` | 二选一 | 无 | ODPS 可推荐商品表。与 `--eligible-items-csv` 二选一。 |
+| `--plm-path DIR` | 否 | 项目内 `bert-base-uncased/` | 本地文本编码器目录；目录必须存在。 |
+| `--max-seq-length N` | 否 | `50` | 每位用户保留的最近交互数，必须是 `3–100` 的整数。 |
+| `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
+| `--env-file FILE` | 条件使用 | 项目根目录 `.env` | 任一输入来自 ODPS，或指定 `--output-table` 时读取。文件必须存在。纯 CSV 流程无需指定。 |
+| `--output-table NAME` | 否 | 不写 ODPS | 除 CSV 结果外，再将逐条推荐写入该 ODPS 表。已有同名表会被删除并重建。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 保存所有中间数据、检查点和预测结果。 |
+| `--python EXECUTABLE` | 否 | `python3` | 全部 Python 阶段使用的解释器。 |
+
+`all` 自动把本次预训练的最后一个检查点交给微调，再把本次微调模型交给预测。因此不能给 `all` 传入三个独立阶段检查点参数。
+
+#### 主要输出
+
+```text
+<work-dir>/raw/<dataset>.csv
+<work-dir>/downstream/<dataset>/
+<work-dir>/checkpoints/pretrain/*.pth
+<work-dir>/checkpoints/finetune/UniSRec-<dataset>-finetuned.pth
+<work-dir>/results/<dataset>-recommendations.csv
+<work-dir>/results/<dataset>-details-<date>.csv
+```
+
+### 1. fetch：准备标准交互 CSV
+
+`fetch` 将 CSV、ODPS 表或 ODPS SQL 的结果统一为项目内部五字段 CSV。
+
+#### ODPS 表输入示例
+
+```bash
 bash run.sh --stage fetch \
   --dataset catalog \
   --input-table your_interaction_table \
   --env-file /path/to/.env \
   --work-dir "$WORK_DIR" \
-  --python python3
+  --python "$PYTHON_BIN"
 ```
 
-| 可指定参数 | 说明 |
-| --- | --- |
-| `--dataset NAME` | 必填；输出文件为 `<work-dir>/raw/NAME.csv`。 |
-| `--input-csv FILE` / `--input-table NAME` / `--input-query-file FILE` | 必须且只能选一个。分别读取已有 CSV、ODPS 表全部行、或执行文件中的 ODPS SQL。 |
-| `--env-file FILE` | ODPS 来源需要；默认项目根目录 `.env`。CSV 来源不需要。 |
-| `--work-dir DIR` | 输出根目录，内部传给 `prepare_interactions.py` 的 `--output-dir` 实际是 `DIR/raw`。 |
-| `--python EXECUTABLE` | 执行取数与 CSV 标准化脚本的 Python，默认 `python3`。 |
+#### 可执行参数
 
-`--output-dir` 是内部 Python 脚本的参数，**不是** `run.sh` 的参数。切换来源时，仅替换上述命令中的 `--input-table`：
+| 参数 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--stage fetch` | 是 | 无 | 只执行数据获取与字段标准化。 |
+| `--dataset NAME` | 是 | 无 | 输出文件名主体。 |
+| `--input-csv FILE` | 三选一 | 无 | 已有 CSV 文件；需符合标准字段或兼容的历史字段。 |
+| `--input-table NAME` | 三选一 | 无 | ODPS 交互表名；读取表的全部行。 |
+| `--input-query-file FILE` | 三选一 | 无 | 包含 ODPS SQL 的文件；查询结果需符合标准字段或历史字段。 |
+| `--env-file FILE` | ODPS 来源使用 | 项目根目录 `.env` | `--input-table` 或 `--input-query-file` 模式的连接配置。CSV 模式不读取该文件。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 标准 CSV 写入 `DIR/raw/`。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行下载和 CSV 标准化脚本。 |
+
+三种来源必须且只能指定一个。`--output-dir` 是内部 Python 脚本参数，不是 `run.sh` 参数。
+
+#### 其他来源示例
 
 ```bash
-# 已有 CSV：不需要 --env-file
-bash run.sh --stage fetch --dataset catalog --input-csv /path/to/interactions.csv --work-dir "$WORK_DIR" --python python3
+# 已有 CSV
+bash run.sh --stage fetch \
+  --dataset catalog \
+  --input-csv /path/to/interactions.csv \
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
 
-# 自定义 ODPS SQL：可以在 SQL 中指定日期范围与列名
-bash run.sh --stage fetch --dataset catalog --input-query-file /path/to/query.sql --env-file /path/to/.env --work-dir "$WORK_DIR" --python python3
+# 自定义 ODPS SQL
+bash run.sh --stage fetch \
+  --dataset catalog \
+  --input-query-file /path/to/query.sql \
+  --env-file /path/to/.env \
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
 ```
 
-### 2. preprocess：生成训练数据与商品向量
+#### 输入与输出
+
+- 标准字段：`user_id,item_id,event_value,event_time,item_text`。
+- 兼容历史字段：`user_id,prod_id,purchase_count,dt,attrvalues`。
+- 输出：`<work-dir>/raw/<dataset>.csv`。
+
+### 2. preprocess：生成序列数据和商品文本向量
+
+#### 执行示例
 
 ```bash
 bash run.sh --stage preprocess \
   --dataset catalog \
-  --work-dir "$WORK_DIR" \
   --plm-path /path/to/text_encoder \
   --max-seq-length 50 \
-  --python python3
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
 ```
 
-| 可指定参数 | 说明 |
-| --- | --- |
-| `--dataset NAME` | 必填；读取 `<work-dir>/raw/NAME.csv`，写入 `<work-dir>/downstream/NAME/`。 |
-| `--work-dir DIR` | 与 `fetch` 相同的工作目录；默认项目内 `outputs/`。 |
-| `--plm-path DIR` | 本地文本编码器目录；默认项目内 `bert-base-uncased/`。 |
-| `--max-seq-length N` | 每位用户保留最近 N 次交互，训练、验证、测试和生产预测均使用该窗口；默认 50，范围 3–100。 |
-| `--python EXECUTABLE` | Python 可执行文件；默认 `python3`。 |
+#### 可执行参数
+
+| 参数 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--stage preprocess` | 是 | 无 | 只执行预处理。 |
+| `--dataset NAME` | 是 | 无 | 读取同名标准 CSV，并作为产物文件名前缀。 |
+| `--plm-path DIR` | 否 | 项目内 `bert-base-uncased/` | 文本编码器目录；必须存在。用于生成商品向量。 |
+| `--max-seq-length N` | 否 | `50` | 每位用户保留最近 N 次交互，必须是 `3–100` 的整数。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 输入来自 `DIR/raw/`，产物写入 `DIR/downstream/`。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行预处理和文本编码。 |
+
+#### 前置文件
+
+```text
+<work-dir>/raw/<dataset>.csv
+```
+
+#### 输出文件
+
+```text
+<work-dir>/downstream/<dataset>/<dataset>.train.inter
+<work-dir>/downstream/<dataset>/<dataset>.valid.inter
+<work-dir>/downstream/<dataset>/<dataset>.test.inter
+<work-dir>/downstream/<dataset>/<dataset>.predict.inter
+<work-dir>/downstream/<dataset>/<dataset>.feat1CLS
+<work-dir>/downstream/<dataset>/<dataset>.feat2CLS
+<work-dir>/downstream/<dataset>/index2user.json
+<work-dir>/downstream/<dataset>/index2item.json
+```
+
+`run.sh` 当前固定使用 `word_drop_ratio=0.2`；用户和商品交互过滤采用预处理脚本默认值。它们不是当前 Bash 入口可指定的参数。
 
 ### 3. pretrain：预训练
+
+#### 从头预训练
 
 ```bash
 bash run.sh --stage pretrain \
   --dataset catalog \
   --work-dir "$WORK_DIR" \
-  --python python3
+  --python "$PYTHON_BIN"
 ```
 
-| 可指定参数 | 说明 |
-| --- | --- |
-| `--dataset NAME` | 必填；读取对应数据集的训练原子文件和两份商品向量。 |
-| `--work-dir DIR` | 从 `DIR/downstream/` 读取数据，向 `DIR/checkpoints/pretrain/` 保存权重。 |
-| `--resume-checkpoint FILE` | 可选；恢复模型、优化器和训练轮次，从该预训练检查点的下一轮继续。仅适用于独立运行 `pretrain`。 |
-| `--python EXECUTABLE` | Python 可执行文件；默认 `python3`。 |
+#### 可执行参数
 
-命令会打印本次生成的预训练权重路径，供独立微调使用。
+| 参数 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--stage pretrain` | 是 | 无 | 只执行预训练。 |
+| `--dataset NAME` | 是 | 无 | 指定预处理数据集和检查点文件名前缀。 |
+| `--resume-checkpoint FILE` | 否 | 从头训练 | 恢复模型、优化器和训练轮次，从检查点的下一轮继续；文件必须存在且数据集必须一致。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取 `DIR/downstream/<dataset>/`，写入 `DIR/checkpoints/pretrain/`。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行预训练。GPU 环境建议使用 Conda Python 的绝对路径。 |
 
-从检查点继续预训练：
+#### 前置文件
+
+```text
+<work-dir>/downstream/<dataset>/<dataset>.train.inter
+<work-dir>/downstream/<dataset>/<dataset>.feat1CLS
+<work-dir>/downstream/<dataset>/<dataset>.feat2CLS
+```
+
+#### 从检查点恢复示例
 
 ```bash
 bash run.sh --stage pretrain \
   --dataset catalog \
   --resume-checkpoint "$WORK_DIR/checkpoints/pretrain/UniSRec-catalog-12.pth" \
   --work-dir "$WORK_DIR" \
-  --python python3
+  --python "$PYTHON_BIN"
 ```
 
-`pretrain_epochs` 表示包含检查点已完成轮次在内的总轮数。例如从第 12 轮检查点恢复且
-`pretrain_epochs: 50`，程序会继续执行第 13–50 轮。
+`pretrain_epochs` 是包含检查点已完成轮次在内的总轮数。例如从第 12 轮检查点恢复且配置为 50，程序继续执行第 13–50 轮。新检查点写入：
+
+```text
+<work-dir>/checkpoints/pretrain/UniSRec-<dataset>-<epoch>.pth
+```
 
 ### 4. finetune：微调
+
+#### 执行示例
 
 ```bash
 bash run.sh --stage finetune \
   --dataset catalog \
-  --pretrained-checkpoint /path/to/pretrained.pth \
+  --pretrained-checkpoint "$WORK_DIR/checkpoints/pretrain/UniSRec-catalog-50.pth" \
   --work-dir "$WORK_DIR" \
-  --python python3
+  --python "$PYTHON_BIN"
 ```
 
-| 可指定参数 | 说明 |
-| --- | --- |
-| `--dataset NAME` | 必填；读取对应数据集的训练、验证和测试原子文件。 |
-| `--pretrained-checkpoint FILE` | 独立运行 `finetune` 时必填；使用 `pretrain` 打印的实际权重路径。 |
-| `--work-dir DIR` | 从 `DIR/downstream/` 读取数据，向 `DIR/checkpoints/finetune/` 保存权重。 |
-| `--python EXECUTABLE` | Python 可执行文件；默认 `python3`。 |
+#### 可执行参数
+
+| 参数 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--stage finetune` | 是 | 无 | 只执行微调。 |
+| `--dataset NAME` | 是 | 无 | 指定预处理数据集和微调模型文件名。 |
+| `--pretrained-checkpoint FILE` | 是 | 无 | 预训练检查点；文件必须存在。独立微调不会自动推断该路径。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取 `DIR/downstream/<dataset>/`，写入 `DIR/checkpoints/finetune/`。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行微调。 |
+
+#### 前置文件
+
+```text
+<work-dir>/downstream/<dataset>/<dataset>.train.inter
+<work-dir>/downstream/<dataset>/<dataset>.valid.inter
+<work-dir>/downstream/<dataset>/<dataset>.test.inter
+<work-dir>/downstream/<dataset>/<dataset>.feat1CLS
+<pretrained-checkpoint>
+```
+
+#### 输出文件
+
+```text
+<work-dir>/checkpoints/finetune/UniSRec-<dataset>-finetuned.pth
+```
 
 ### 5. predict：生成推荐结果
+
+#### CSV 商品信息示例
 
 ```bash
 bash run.sh --stage predict \
   --dataset catalog \
   --item-metadata-csv /path/to/item_metadata.csv \
   --eligible-items-csv /path/to/eligible_items.csv \
-  --finetuned-checkpoint /path/to/finetuned.pth \
+  --finetuned-checkpoint "$WORK_DIR/checkpoints/finetune/UniSRec-catalog-finetuned.pth" \
   --top-k 50 \
   --work-dir "$WORK_DIR" \
-  --python python3
+  --python "$PYTHON_BIN"
 ```
 
-| 可指定参数 | 说明 |
-| --- | --- |
-| `--dataset NAME` | 必填；读取对应数据集的预处理结果。 |
-| `--item-metadata-csv FILE` / `--item-metadata-table NAME` | 商品品类来源，二选一；需有 `item_id,category_id` 字段。 |
-| `--eligible-items-csv FILE` / `--eligible-items-table NAME` | 可推荐商品来源，二选一；需有 `item_id` 字段。 |
-| `--finetuned-checkpoint FILE` | 可选；默认 `DIR/checkpoints/finetune/UniSRec-NAME-finetuned.pth`。 |
-| `--top-k NUMBER` | 每用户最多保留的推荐数量，默认 `50`，必须为正整数。 |
-| `--output-table NAME` | 可选；指定时还会将逐条推荐结果写入该 ODPS 表，并删除、重建已有同名表。 |
-| `--env-file FILE` | 使用任一 ODPS 商品表或 `--output-table` 时需要；默认项目根目录 `.env`。 |
-| `--work-dir DIR` | 从 `DIR/downstream/` 读取数据，向 `DIR/results/` 写出 CSV；默认项目内 `outputs/`。 |
-| `--python EXECUTABLE` | Python 可执行文件；默认 `python3`。 |
+#### 可执行参数
 
-若商品信息来自 ODPS，并且要把结果写回 ODPS，可将预测命令中的两个 CSV 参数替换为以下参数，同时指定连接配置与目标表：
+| 参数 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--stage predict` | 是 | 无 | 只执行预测。 |
+| `--dataset NAME` | 是 | 无 | 指定预处理数据集和结果文件名前缀。 |
+| `--item-metadata-csv FILE` | 二选一 | 无 | 商品品类 CSV，包含 `item_id,category_id`。与 `--item-metadata-table` 二选一。 |
+| `--item-metadata-table NAME` | 二选一 | 无 | ODPS 商品品类表。与 `--item-metadata-csv` 二选一。 |
+| `--eligible-items-csv FILE` | 二选一 | 无 | 可推荐商品 CSV，包含 `item_id`。与 `--eligible-items-table` 二选一。 |
+| `--eligible-items-table NAME` | 二选一 | 无 | ODPS 可推荐商品表。与 `--eligible-items-csv` 二选一。 |
+| `--finetuned-checkpoint FILE` | 否 | `DIR/checkpoints/finetune/UniSRec-NAME-finetuned.pth` | 指定微调模型；省略时使用工作目录中的默认文件。 |
+| `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
+| `--output-table NAME` | 否 | 不写 ODPS | 额外写入 ODPS 结果表；已有同名表会被删除并重建。CSV 始终生成。 |
+| `--env-file FILE` | 条件使用 | 项目根目录 `.env` | 使用任一 ODPS 商品表或 `--output-table` 时读取。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取预处理产物和默认模型，结果写入 `DIR/results/`。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行模型推理及可选 ODPS 写表。 |
+
+每组商品来源必须且只能选择一种；商品品类和可推荐商品可以分别使用 CSV 或 ODPS，不要求来源类型相同。
+
+#### 前置文件
+
+```text
+<work-dir>/downstream/<dataset>/<dataset>.train.inter
+<work-dir>/downstream/<dataset>/<dataset>.valid.inter
+<work-dir>/downstream/<dataset>/<dataset>.predict.inter
+<work-dir>/downstream/<dataset>/<dataset>.feat1CLS
+<work-dir>/downstream/<dataset>/index2user.json
+<work-dir>/downstream/<dataset>/index2item.json
+<finetuned-checkpoint>
+```
+
+#### ODPS 商品信息与结果表示例
 
 ```bash
-bash run.sh --stage predict --dataset catalog \
+bash run.sh --stage predict \
+  --dataset catalog \
   --item-metadata-table your_metadata_table \
   --eligible-items-table your_eligible_items_table \
   --output-table your_result_table \
   --env-file /path/to/.env \
-  --finetuned-checkpoint /path/to/finetuned.pth \
-  --top-k 50 --work-dir "$WORK_DIR" --python python3
+  --finetuned-checkpoint "$WORK_DIR/checkpoints/finetune/UniSRec-catalog-finetuned.pth" \
+  --top-k 50 \
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
 ```
 
-`--stage all` 按以上顺序执行：需要 `--dataset`、一种交互来源、一种商品品类来源和一种可推荐商品来源；可指定 `--work-dir`、`--plm-path`、`--max-seq-length`、`--env-file`、`--python`、`--top-k`、`--output-table`。`--resume-checkpoint`、`--pretrained-checkpoint` 和 `--finetuned-checkpoint` 仅用于对应的独立阶段，不能传给 `all`。任一阶段失败，完整流水线立即停止。
+#### 输出
+
+```text
+<work-dir>/results/<dataset>-recommendations.csv
+<work-dir>/results/<dataset>-details-<date>.csv
+<output-table>  # 仅指定 --output-table 时写入
+```
+
+### Bash 参数与 YAML 超参数的边界
+
+`run.sh` 负责数据来源、路径、阶段选择和阶段衔接。训练轮数、学习率、批量大小、模型层数等不通过 Bash 指定，而是在 YAML 中配置：
+
+| 配置文件 | 作用 | 主要参数示例 |
+| --- | --- | --- |
+| `configs/UniSRec.yaml` | 预训练与微调共享的模型结构 | `n_layers`、`n_heads`、`hidden_size`、`inner_size`、dropout、文本向量和适配器参数。 |
+| `configs/pretrain.yaml` | 预训练数据和优化参数 | `pretrain_epochs`、`save_step`、`train_batch_size`、`learning_rate`、`MAX_ITEM_LIST_LENGTH`。 |
+| `configs/finetune.yaml` | 微调、验证和早停参数 | `epochs`、`train_batch_size`、`learning_rate`、`weight_decay`、`eval_step`、`stopping_step`、评估指标。 |
+
+例如，调整预训练总轮数或学习率，应修改 `configs/pretrain.yaml`，而不是给 `run.sh` 增加 `--epochs` 或 `--learning-rate`。
