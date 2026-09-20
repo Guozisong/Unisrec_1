@@ -111,6 +111,55 @@ ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_tab
 
 每个阶段开始时打印数据集、工作目录、主要输入和输出路径；完成时打印耗时。阶段失败时打印阶段名、退出码和耗时，完整流水线随即停止。日志不输出 `.env` 的凭据内容。
 
+### 使用 nohup 后台执行
+
+`nohup` 可以包装本项目的完整流水线或任意独立阶段，并不限定于训练命令。它使进程忽略 SSH
+会话断开产生的 `SIGHUP` 信号；末尾的 `&` 将命令放到后台，`> ... 2>&1` 将标准输出和错误
+统一写入日志。通用形式如下，其中 `RUN_SH_OPTIONS` 表示原命令的全部参数：
+
+```bash
+mkdir -p "$WORK_DIR/logs"
+nohup bash run.sh RUN_SH_OPTIONS > "$WORK_DIR/logs/pipeline.out" 2>&1 &
+echo $!
+```
+
+例如，将前面的完整流水线放到后台运行：
+
+```bash
+WORK_DIR=/path/to/work_dir
+mkdir -p "$WORK_DIR/logs"
+
+nohup bash run.sh --stage all --dataset catalog \
+  --input-csv /path/to/interactions.csv \
+  --item-metadata-csv /path/to/item_metadata.csv \
+  --eligible-items-csv /path/to/eligible_items.csv \
+  --plm-path /path/to/text_encoder \
+  --max-seq-length 50 \
+  --work-dir "$WORK_DIR" \
+  --python /absolute/path/to/conda/envs/unisrec/bin/python3 \
+  > "$WORK_DIR/logs/pipeline.out" 2>&1 &
+
+echo $!
+```
+
+同样的写法适用于 `fetch`、`preprocess`、`pretrain`、`finetune` 和 `predict`：保持对应阶段原有的
+参数不变，只在命令前增加 `nohup`，并在末尾增加日志重定向和 `&`。`echo $!` 输出后台 Bash
+进程 PID。重新连接 SSH 后可执行：
+
+```bash
+# 实时查看日志；Ctrl+C 只退出日志查看，不会停止后台任务
+tail -f "$WORK_DIR/logs/pipeline.out"
+
+# 查看各阶段的开始、完成或失败状态
+grep -aE "stage=.* (START|COMPLETE|FAILED)" "$WORK_DIR/logs/pipeline.out"
+
+# 查找仍在运行的流水线及各阶段 Python 进程
+pgrep -af "run.sh|prepare_interactions.py|preprocess.py|pretrain.py|finetune.py|predict.py"
+```
+
+`nohup` 只避免进程随 SSH 会话断开而退出，不能防止 Pod 重启、删除、驱逐、平台任务超时、
+OOM 或节点故障。不要为同一个数据集和工作目录同时启动相同阶段，否则可能同时写入同名文件。
+
 迁移已有 ODPS 部署时，需要将原商品信息字段映射为 `item_id,category_id`，将可推荐商品字段映射为 `item_id`。可选结果表现在使用 `user_id,item_id,score`，原先依赖其他列名的下游任务需要同步调整。原来写死的试验用户复制规则已移除，推荐结果只包含真实输入用户。
 
 ## 数据流与输出
