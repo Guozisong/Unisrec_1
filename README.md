@@ -203,9 +203,23 @@ bash run.sh --stage pretrain \
 | --- | --- |
 | `--dataset NAME` | 必填；读取对应数据集的训练原子文件和两份商品向量。 |
 | `--work-dir DIR` | 从 `DIR/downstream/` 读取数据，向 `DIR/checkpoints/pretrain/` 保存权重。 |
+| `--resume-checkpoint FILE` | 可选；恢复模型、优化器和训练轮次，从该预训练检查点的下一轮继续。仅适用于独立运行 `pretrain`。 |
 | `--python EXECUTABLE` | Python 可执行文件；默认 `python3`。 |
 
 命令会打印本次生成的预训练权重路径，供独立微调使用。
+
+从检查点继续预训练：
+
+```bash
+bash run.sh --stage pretrain \
+  --dataset catalog \
+  --resume-checkpoint "$WORK_DIR/checkpoints/pretrain/UniSRec-catalog-12.pth" \
+  --work-dir "$WORK_DIR" \
+  --python python3
+```
+
+`pretrain_epochs` 表示包含检查点已完成轮次在内的总轮数。例如从第 12 轮检查点恢复且
+`pretrain_epochs: 50`，程序会继续执行第 13–50 轮。
 
 ### 4. finetune：微调
 
@@ -261,4 +275,4 @@ bash run.sh --stage predict --dataset catalog \
   --top-k 50 --work-dir "$WORK_DIR" --python python3
 ```
 
-`--stage all` 按以上顺序执行：需要 `--dataset`、一种交互来源、一种商品品类来源和一种可推荐商品来源；可指定 `--work-dir`、`--plm-path`、`--max-seq-length`、`--env-file`、`--python`、`--top-k`、`--output-table`。`--pretrained-checkpoint` 和 `--finetuned-checkpoint` 仅用于独立阶段，不能传给 `all`。任一阶段失败，完整流水线立即停止。
+`--stage all` 按以上顺序执行：需要 `--dataset`、一种交互来源、一种商品品类来源和一种可推荐商品来源；可指定 `--work-dir`、`--plm-path`、`--max-seq-length`、`--env-file`、`--python`、`--top-k`、`--output-table`。`--resume-checkpoint`、`--pretrained-checkpoint` 和 `--finetuned-checkpoint` 仅用于对应的独立阶段，不能传给 `all`。任一阶段失败，完整流水线立即停止。

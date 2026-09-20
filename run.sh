@@ -24,6 +24,7 @@ Options:
   --python EXECUTABLE  Python executable (default: python3)
   --top-k NUMBER       Number of recommended items (default: 50)
   --output-table NAME  Optional ODPS result table; predictions are always saved as CSV
+  --resume-checkpoint FILE     Checkpoint for resuming a standalone pretrain stage
   --pretrained-checkpoint FILE  Weight file for a standalone finetune stage
   --finetuned-checkpoint FILE   Weight file for a standalone predict stage
   -h, --help           Show this help
@@ -47,12 +48,13 @@ env_file=$repo_dir/.env
 python=python3
 top_k=50
 output_table=
+resume_checkpoint=
 pretrained_checkpoint=
 finetuned_checkpoint=
 
 while (($#)); do
   case "$1" in
-    --stage|--dataset|--input-csv|--input-table|--input-query-file|--item-metadata-csv|--eligible-items-csv|--item-metadata-table|--eligible-items-table|--work-dir|--plm-path|--max-seq-length|--env-file|--python|--top-k|--output-table|--pretrained-checkpoint|--finetuned-checkpoint)
+    --stage|--dataset|--input-csv|--input-table|--input-query-file|--item-metadata-csv|--eligible-items-csv|--item-metadata-table|--eligible-items-table|--work-dir|--plm-path|--max-seq-length|--env-file|--python|--top-k|--output-table|--resume-checkpoint|--pretrained-checkpoint|--finetuned-checkpoint)
       if (($# < 2)); then echo "Missing value for $1" >&2; exit 2; fi
       case "$1" in
         --stage) stage=$2 ;;
@@ -71,6 +73,7 @@ while (($#)); do
         --python) python=$2 ;;
         --top-k) top_k=$2 ;;
         --output-table) output_table=$2 ;;
+        --resume-checkpoint) resume_checkpoint=$2 ;;
         --pretrained-checkpoint) pretrained_checkpoint=$2 ;;
         --finetuned-checkpoint) finetuned_checkpoint=$2 ;;
       esac
@@ -84,6 +87,10 @@ case "$stage" in
   all|fetch|preprocess|pretrain|finetune|predict) ;;
   *) echo "Unknown stage: $stage" >&2; exit 2 ;;
 esac
+if [[ -n "$resume_checkpoint" && "$stage" != pretrain ]]; then
+  echo "--resume-checkpoint is only used with --stage pretrain" >&2
+  exit 2
+fi
 if [[ -n "$pretrained_checkpoint" && "$stage" != finetune ]]; then
   echo "--pretrained-checkpoint is only used with --stage finetune" >&2
   exit 2
@@ -153,6 +160,13 @@ for source in input_csv input_query_file item_metadata_csv eligible_items_csv; d
     printf -v "$source" '%s/%s' "$(cd "$(dirname "${!source}")" && pwd)" "$(basename "${!source}")"
   fi
 done
+if [[ "$stage" == pretrain && -n "$resume_checkpoint" ]]; then
+  if [[ ! -f "$resume_checkpoint" ]]; then
+    echo "Pretraining checkpoint does not exist: $resume_checkpoint" >&2
+    exit 2
+  fi
+  resume_checkpoint=$(cd "$(dirname "$resume_checkpoint")" && pwd)/$(basename "$resume_checkpoint")
+fi
 if [[ "$stage" == finetune ]]; then
   if [[ -z "$pretrained_checkpoint" || ! -f "$pretrained_checkpoint" ]]; then
     echo "--stage finetune requires --pretrained-checkpoint FILE" >&2
@@ -214,8 +228,10 @@ pretrain() {
   check_data train.inter feat1CLS feat2CLS
   mkdir -p "$pretrain_dir"
   checkpoint_path_file=$(mktemp "$work_dir/.pretrain-path.XXXXXX")
-  "$python" pretrain.py -d "$dataset" --data-path "$data_dir" --checkpoint-dir "$pretrain_dir" \
-    --checkpoint-path-file "$checkpoint_path_file"
+  local args=(-d "$dataset" --data-path "$data_dir" --checkpoint-dir "$pretrain_dir"
+    --checkpoint-path-file "$checkpoint_path_file")
+  if [[ -n "$resume_checkpoint" ]]; then args+=(--resume-checkpoint "$resume_checkpoint"); fi
+  "$python" pretrain.py "${args[@]}"
   if [[ ! -s "$checkpoint_path_file" ]]; then
     echo "Pretraining did not report a checkpoint" >&2
     exit 1
@@ -273,7 +289,8 @@ stage_info() {
       printf 'input=%s output=%s max_seq_length=%s encoder=%s' \
         "$raw_dir/$dataset.csv" "$data_dir/$dataset" "$max_seq_length" "$plm_path" ;;
     pretrain)
-      printf 'input=%s output=%s' "$data_dir/$dataset" "$pretrain_dir" ;;
+      printf 'input=%s output=%s' "$data_dir/$dataset" "$pretrain_dir"
+      if [[ -n "$resume_checkpoint" ]]; then printf ' resume=%s' "$resume_checkpoint"; fi ;;
     finetune)
       printf 'input=%s checkpoint=%s output=%s' \
         "$data_dir/$dataset" "$2" "$finetune_dir" ;;

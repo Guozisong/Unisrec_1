@@ -101,6 +101,21 @@ class PipelineTest(unittest.TestCase):
                     if stage == 'preprocess':
                         self.assertIn('--max_seq_length 40', log.read_text())
 
+            resume_checkpoint = work / 'checkpoints' / 'pretrain' / 'epoch-12.pth'
+            resume_checkpoint.touch()
+            log.write_text('')
+            resumed = subprocess.run(
+                ["bash", str(ROOT / "run.sh"), "--stage", "pretrain", "--dataset", dataset,
+                 "--work-dir", str(work), "--python", str(fake_python),
+                 "--resume-checkpoint", str(resume_checkpoint)],
+                cwd=work,
+                env={**os.environ, "STAGE_LOG": str(log)},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertIn(f'--resume-checkpoint {resume_checkpoint}', log.read_text())
+
             invalid = subprocess.run(
                 ["bash", str(ROOT / "run.sh"), "--stage", "preprocess", "--dataset", dataset,
                  "--work-dir", str(work), "--plm-path", str(encoder), "--python", str(fake_python),
