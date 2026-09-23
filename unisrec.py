@@ -193,17 +193,21 @@ class UniSRec(SASRec):
         """
         return loss
 
-    def full_sort_predict(self, interaction):
+    def get_full_sort_item_embeddings(self):
+        item_embeddings = self.moe_adaptor(self.plm_embedding.weight)
+        if self.train_stage == 'transductive_ft':
+            item_embeddings = item_embeddings + self.item_embedding.weight
+        return F.normalize(item_embeddings, dim=-1)
+
+    def full_sort_predict_with_item_embeddings(self, interaction, item_embeddings):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         item_emb_list = self.moe_adaptor(self.plm_embedding(item_seq))
         seq_output = self.forward(item_seq, item_emb_list, item_seq_len)
-        test_items_emb = self.moe_adaptor(self.plm_embedding.weight)
-        if self.train_stage == 'transductive_ft':
-            test_items_emb = test_items_emb + self.item_embedding.weight
-
         seq_output = F.normalize(seq_output, dim=-1)
-        test_items_emb = F.normalize(test_items_emb, dim=-1)
 
-        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B n_items]
-        return scores
+        return torch.matmul(seq_output, item_embeddings.transpose(0, 1))  # [B n_items]
+
+    def full_sort_predict(self, interaction):
+        item_embeddings = self.get_full_sort_item_embeddings()
+        return self.full_sort_predict_with_item_embeddings(interaction, item_embeddings)

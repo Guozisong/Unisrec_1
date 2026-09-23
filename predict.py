@@ -1,231 +1,139 @@
 import argparse
+import csv
+import json
+import math
+import os
+
+import torch
 from recbole.config import Config
 from recbole.data import data_preparation
 
-from unisrec import UniSRec
 from recbole_data.dataset import UniSRecDataset
-import torch
-import numpy as np
-import pandas as pd
-import json
-import os
-import re
-from datetime import datetime
-from odps.models import Schema, Column
-from data_pipeline.raw.get_data_from_odps import connect_odps
+from unisrec import UniSRec
 
 
-def write_to_odps(df1, env_file, table_name1):
-    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]*', table_name1):
-        raise ValueError('ODPS table name must contain only letters, digits, underscores, or dots')
-    odps = connect_odps(env_file)
-
-    columns = [
-        Column(name='user_id', type='string', comment='用户索引'),
-        Column(name='item_id', type='string', comment='Item identifier'),
-        Column(name='score', type='double', comment='Recommendation score')]
-
-    schema = Schema(columns=columns)
-    
-    # 检查表是否存在，如果存在则删除
-    if odps.exist_table(table_name1):
-        odps.delete_table(table_name1, if_exists=True)
-        print(f"Table {table_name1} has been dropped.")
-  
-    odps.create_table(table_name1, schema, if_not_exists=True)
-    print(f"Table {table_name1} has been created.")
-
-    # 将DataFrame写入ODPS表
-    odps.write_table(table_name1, df1, overwrite=True)
-
-    print(f"Data has been written to {table_name1}")
-
-def read_from_odps(env_file, metadata_table, eligible_table):
-    odps = connect_odps(env_file)
-    for table in (metadata_table, eligible_table):
-        if table and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]*', table):
-            raise ValueError('ODPS table name must contain only letters, digits, underscores, or dots')
-    sql_1 = f'SELECT item_id, category_id FROM {metadata_table}' if metadata_table else None
-    sql_2 = f'SELECT item_id FROM {eligible_table}' if eligible_table else None
-    
-    items_info_1 = odps.execute_sql(sql_1).open_reader(tunnel=True).to_pandas(n_process=4) if sql_1 else None
-    items_info_2 = odps.execute_sql(sql_2).open_reader(tunnel=True).to_pandas(n_process=4) if sql_2 else None
-    return (items_info_1, items_info_2)
+def mask_history_scores(scores, item_sequences):
+    scores[:, 0] = float('-inf')
+    return scores.scatter_(1, item_sequences, float('-inf'))
 
 
-def diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=10, top_k=50):
-    # 建立 item_id -> category_id 映射字典
-    item2category = dict(zip(prod_cate_info['item_id'], prod_cate_info['category_id']))
-    valid_items = set(valid_prod['item_id'].to_list())
+def build_original_id_lookup(id_tokens, original_ids):
+    return [
+        None if str(token) == '[PAD]' else original_ids[str(token)]
+        for token in id_tokens
+    ]
 
-    diversified_items = [] 
-    diversified_scores = []
 
-    for items, scores in zip(rec_items, rec_items_score):
-        cate_count = {}
-        new_items = []
-        new_scores = []
-
-        for item, score in zip(items, scores):
-
-            cate_id = item2category.get(item, None)
-            if cate_id is None:
-                continue 
-            # 保证商品有效
-            if item not in valid_items:
+def write_prediction_rows(writer, user_ids, item_ids, scores,
+                          user_lookup, item_lookup):
+    row_count = 0
+    for user_id, recommended_items, recommended_scores in zip(
+            user_ids, item_ids, scores):
+        original_user_id = user_lookup[int(user_id)]
+        for item_id, score in zip(recommended_items, recommended_scores):
+            score = float(score)
+            if not math.isfinite(score):
                 continue
+            writer.writerow((original_user_id, item_lookup[int(item_id)], score))
+            row_count += 1
+    return row_count
 
-            if cate_count.get(cate_id, 0) < max_per_cate: # 保证每个指定品类商品数不超过阈值
-                new_items.append(item)
-                new_scores.append(score)
-                cate_count[cate_id] = cate_count.get(cate_id, 0) + 1
 
-            # 提前终止，如果已经到达 top_k 限制
-            if len(new_items) >= top_k:
-                break
-
-        # 保证返回长度不超过 top_k
-        diversified_items.append(new_items[:top_k])
-        diversified_scores.append(new_scores[:top_k])
-
-    return diversified_items, diversified_scores
-
-def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
-              env_file='.env', output_table=None, item_metadata_csv=None,
-              eligible_items_csv=None, item_metadata_table=None, eligible_items_table=None):
-    # 配置文件
-    props = ['configs/UniSRec.yaml', 'configs/finetune.yaml']
+def predictor(dataset, model_file, top_k, result_save_path, data_path=None):
+    config_files = ['configs/UniSRec.yaml', 'configs/finetune.yaml']
     overrides = {'benchmark_filename': ['train', 'valid', 'predict']}
     if data_path:
         overrides['data_path'] = data_path
-    config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=overrides)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("加载数据 ...")
-    dataset_ = UniSRecDataset(config)
-    _, _, test_data = data_preparation(config, dataset_)
+    config = Config(
+        model=UniSRec,
+        dataset=dataset,
+        config_file_list=config_files,
+        config_dict=overrides,
+    )
+    device = config['device']
 
-    dataset_path = config["data_path"]
-    with open(os.path.join(dataset_path, "index2user.json"), 'r', encoding='utf-8') as f:
-        index2user = json.load(f)
-    with open(os.path.join(dataset_path, "index2item.json"), 'r', encoding='utf-8') as f:
-        index2item = json.load(f)
+    print('[predict] Loading dataset')
+    dataset_object = UniSRecDataset(config)
+    _, _, prediction_data = data_preparation(config, dataset_object)
 
-    print("加载模型 ...")
-    model = UniSRec(config, test_data.dataset).to(config['device'])
+    dataset_path = config['data_path']
+    with open(os.path.join(dataset_path, 'index2user.json'), encoding='utf-8') as file:
+        index2user = json.load(file)
+    with open(os.path.join(dataset_path, 'index2item.json'), encoding='utf-8') as file:
+        index2item = json.load(file)
+
+    user_lookup = build_original_id_lookup(
+        dataset_object.field2id_token[config['USER_ID_FIELD']], index2user)
+    item_lookup = build_original_id_lookup(
+        dataset_object.field2id_token[config['ITEM_ID_FIELD']], index2item)
+
+    print('[predict] Loading model')
+    model = UniSRec(config, prediction_data.dataset).to(device)
     checkpoint = torch.load(model_file, map_location=device)
-    model.load_state_dict(checkpoint["state_dict"])
-    model.load_other_parameter(checkpoint.get("other_parameter"))
+    model.load_state_dict(checkpoint['state_dict'])
+    model.load_other_parameter(checkpoint.get('other_parameter'))
     model.eval()
 
-    print("预测 ...")
-    tot_item_num = test_data._dataset.item_num
     os.makedirs(result_save_path, exist_ok=True)
+    output_path = os.path.join(
+        result_save_path, f'{dataset}-recommendations.csv')
+    total_items = prediction_data.dataset.item_num
+    recommendation_count = min(top_k, max(total_items - 1, 0))
+    row_count = 0
 
-    # 真实值
-    users = []  # 用户
-    items_seq = [] # 商品序列（模型输入）
-    rec_items = []  # 推荐商品 （模型输出）
-    rec_items_score = []  # 推荐商品得分（模型输出）
-    
-    with torch.no_grad():
-        for batched_data in test_data:
-            interaction = batched_data[0]
-            scores = model.full_sort_predict(interaction.to(device)).view(-1, tot_item_num)
-            scores[:, 0] = -np.inf
+    print('[predict] Generating recommendations')
+    with torch.inference_mode():
+        item_embeddings = model.get_full_sort_item_embeddings()
+        with open(output_path, 'w', newline='', encoding='utf-8') as output_file:
+            writer = csv.writer(output_file, lineterminator='\n')
+            writer.writerow(('user_id', 'item_id', 'score'))
 
-            users_id = interaction[config["USER_ID_FIELD"]]  # 批次用户ID
-            items_id_list = interaction[config["ITEM_ID_FIELD"] + config["LIST_SUFFIX"]] # 批次用户商品ID序列
-            # 批次用户预测结果
-            topk_values, topk_idx = torch.topk(scores, k=min(800, tot_item_num - 1), dim=1)
-            topk_values = topk_values.cpu().numpy()
-            topk_idx = topk_idx.cpu().numpy()
-        
-            # 用户、商品转换
-            # 用户id转换
-            for user_id in users_id:
-                users.append(index2user[dataset_.field2id_token["user_id"][user_id]])
-            # 用户商品id序列转化
-            for i in range(items_id_list.shape[0]):
-                T = []
-                for j in range(items_id_list.shape[1]):
-                    if items_id_list[i][j] != 0:
-                        T.append(index2item[dataset_.field2id_token["item_id"][items_id_list[i][j]]])
-                items_seq.append(T)
-            # 预测商品id转换
-            for i in range(topk_idx.shape[0]):
-                T = []
-                for j in range(topk_idx.shape[1]):
-                    T.append(index2item[dataset_.field2id_token["item_id"][topk_idx[i][j]]])
-                rec_items.append(T)
-            # 预测商品得分
-            rec_items_score.extend(topk_values.tolist())
+            for batched_data in prediction_data:
+                interaction = batched_data[0].to(device)
+                item_sequences = interaction[
+                    config['ITEM_ID_FIELD'] + config['LIST_SUFFIX']]
+                scores = model.full_sort_predict_with_item_embeddings(
+                    interaction, item_embeddings)
+                mask_history_scores(scores, item_sequences)
+                if recommendation_count == 0:
+                    continue
+                topk_scores, topk_items = torch.topk(
+                    scores, k=recommendation_count, dim=1)
+                row_count += write_prediction_rows(
+                    writer,
+                    interaction[config['USER_ID_FIELD']].detach().cpu().tolist(),
+                    topk_items.detach().cpu().tolist(),
+                    topk_scores.detach().cpu().tolist(),
+                    user_lookup,
+                    item_lookup,
+                )
+
+    print(f'[predict] Saved {row_count} rows to {output_path}')
+    return output_path
 
 
-    
-    # 推荐商品按照三级品类打散, 同一品类下的商品至多保留 n 个，且均为目前在售商品
-    odps_metadata, odps_eligible = (None, None)
-    if item_metadata_table or eligible_items_table:
-        odps_metadata, odps_eligible = read_from_odps(env_file, item_metadata_table, eligible_items_table)
-    prod_cate_info = pd.read_csv(item_metadata_csv, dtype=str) if item_metadata_csv else odps_metadata
-    valid_prod = pd.read_csv(eligible_items_csv, dtype=str) if eligible_items_csv else odps_eligible
-    for frame, columns in ((prod_cate_info, ('item_id', 'category_id')), (valid_prod, ('item_id',))):
-        missing = set(columns) - set(frame.columns)
-        if missing:
-            raise ValueError(f'Prediction source missing columns: {", ".join(sorted(missing))}')
-        for column in columns:
-            frame[column] = frame[column].astype(str)
-    rec_items, rec_items_score = diversify_recommendations(rec_items, rec_items_score, prod_cate_info, valid_prod, max_per_cate=2, top_k=top_k)
-    n = len(users)
-    df = pd.DataFrame({
-        'user_id': users,
-        'history_item_ids': items_seq,
-        'target_item_id': [None] * n,
-        'recommended_item_ids': rec_items,
-        'recommendation_scores': rec_items_score,
-    })
-    
-    csv_path = os.path.join(result_save_path, f'{dataset}-details-{datetime.now().date()}.csv')
-    for column in ('history_item_ids', 'recommended_item_ids', 'recommendation_scores'):
-        df[column] = df[column].map(json.dumps)
-    df.to_csv(csv_path, encoding='utf-8-sig', index=False)
-    print(f"已保存到 {csv_path}")
-    print(f'Prediction rows: {n}')
-    # 购买序列长度前150000的用户
-    n_users = {user for user, seq in sorted(zip(users, items_seq), key=lambda x: len(x[1]), reverse=True)[:150000]}
-    
-    data = []
-    rec_items_score = [[round(x, 6) for x in row] for row in rec_items_score]
-    
-    for user, items, scores in zip(users, rec_items, rec_items_score):
-        if user not in n_users:
-            continue
-        for item, score in zip(items, scores):
-            data.append([user, item, score])
-    df1 = pd.DataFrame(data, columns=['user_id', 'item_id', 'score'])
-    df1.to_csv(os.path.join(result_save_path, f'{dataset}-recommendations.csv'), index=False, encoding='utf-8')
-    if output_table:
-        write_to_odps(df1, env_file, output_table)
-
-if __name__ == '__main__':
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', type=str, required=True, help='dataset name')
-    parser.add_argument('-fp', type=str, required=True, help='finetuned model path')
-    parser.add_argument('-t', type=int, default=50, help='top k scoring items')
-    parser.add_argument('-sp', type=str, default='outputs/results/', help= 'result save path')
+    parser.add_argument('-d', required=True, help='dataset name')
+    parser.add_argument('-fp', required=True, help='fine-tuned model path')
+    parser.add_argument(
+        '-t', type=int, default=50,
+        help='number of recommendations per user')
+    parser.add_argument(
+        '-sp', default='outputs/results/', help='result directory')
     parser.add_argument('--data-path', help='parent directory of the dataset')
-    parser.add_argument('--env-file', default='.env')
-    parser.add_argument('--output-table')
-    parser.add_argument('--item-metadata-csv')
-    parser.add_argument('--eligible-items-csv')
-    parser.add_argument('--item-metadata-table')
-    parser.add_argument('--eligible-items-table')
     args = parser.parse_args()
     if args.t < 1:
         parser.error('-t must be a positive integer')
+    return args
 
-    if (bool(args.item_metadata_csv) == bool(args.item_metadata_table) or
-            bool(args.eligible_items_csv) == bool(args.eligible_items_table)):
-        parser.error('Supply one metadata source and one eligible-item source (CSV or ODPS table)')
-    predictor(args.d, args.fp, args.t, args.sp, args.data_path, args.env_file, args.output_table,
-              args.item_metadata_csv, args.eligible_items_csv,
-              args.item_metadata_table, args.eligible_items_table)
+
+if __name__ == '__main__':
+    arguments = parse_args()
+    predictor(
+        arguments.d,
+        arguments.fp,
+        arguments.t,
+        arguments.sp,
+        arguments.data_path,
+    )
