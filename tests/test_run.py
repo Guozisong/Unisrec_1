@@ -17,10 +17,6 @@ class PipelineTest(unittest.TestCase):
             dataset = 'sample'
             input_csv = work / 'interactions.csv'
             input_csv.write_text('user_id,item_id,event_value,event_time,item_text\n')
-            metadata_csv = work / 'item_metadata.csv'
-            metadata_csv.write_text('item_id,category_id\n')
-            eligible_csv = work / 'eligible_items.csv'
-            eligible_csv.write_text('item_id\n')
             fake_python = work / "python"
             fake_python.write_text(
                 "#!/usr/bin/env python3\n"
@@ -50,8 +46,7 @@ class PipelineTest(unittest.TestCase):
             log = work / "stages.log"
             result = subprocess.run(
                 ["bash", str(ROOT / "run.sh"), "--stage", "all", "--dataset", dataset, "--work-dir", str(work),
-                 "--input-csv", str(input_csv), "--item-metadata-csv", str(metadata_csv),
-                 "--eligible-items-csv", str(eligible_csv), "--plm-path", str(encoder),
+                 "--input-csv", str(input_csv), "--plm-path", str(encoder),
                  "--python", str(fake_python), "--top-k", "30", "--max-seq-length", "40"],
                 cwd=work,
                 env={**os.environ, "STAGE_LOG": str(log)},
@@ -73,14 +68,18 @@ class PipelineTest(unittest.TestCase):
             self.assertIn('--max_seq_length 40', lines[1])
             self.assertIn(str(work / "checkpoints" / "pretrain" / "pretrained.pth"), lines[3])
             self.assertIn(str(work / "checkpoints" / "finetune" / "UniSRec-sample-finetuned.pth"), lines[4])
-            self.assertIn(str(metadata_csv), lines[4])
+            self.assertIn('--data-path', lines[4])
+            self.assertIn('-t 30', lines[4])
+            self.assertNotIn('--item-metadata', lines[4])
+            self.assertNotIn('--eligible-items', lines[4])
+            self.assertNotIn('--output-table', lines[4])
 
             single_stages = [
                 ("fetch", ["--input-csv", str(input_csv)], "prepare_interactions.py"),
                 ("preprocess", ["--plm-path", str(encoder), "--max-seq-length", "40"], "preprocess.py"),
                 ("pretrain", [], "pretrain.py"),
                 ("finetune", ["--pretrained-checkpoint", str(work / "checkpoints" / "pretrain" / "pretrained.pth")], "finetune.py"),
-                ("predict", ["--item-metadata-csv", str(metadata_csv), "--eligible-items-csv", str(eligible_csv), "--finetuned-checkpoint", str(work / "checkpoints" / "finetune" / "UniSRec-sample-finetuned.pth")], "predict.py"),
+                ("predict", ["--finetuned-checkpoint", str(work / "checkpoints" / "finetune" / "UniSRec-sample-finetuned.pth")], "predict.py"),
             ]
             for stage, options, expected in single_stages:
                 with self.subTest(stage=stage):
@@ -128,8 +127,7 @@ class PipelineTest(unittest.TestCase):
             log.write_text("")
             failed = subprocess.run(
                 ["bash", str(ROOT / "run.sh"), "--dataset", dataset, "--work-dir", str(work), "--plm-path", str(encoder),
-                 "--input-csv", str(input_csv), "--item-metadata-csv", str(metadata_csv),
-                 "--eligible-items-csv", str(eligible_csv), "--python", str(fake_python)],
+                 "--input-csv", str(input_csv), "--python", str(fake_python)],
                 cwd=work,
                 env={**os.environ, "STAGE_LOG": str(log), "FAIL_STAGE": "preprocess.py"},
                 capture_output=True,
@@ -151,6 +149,15 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(failed_pretrain.returncode, 12)
             self.assertIn('stage=pretrain FAILED exit=12', failed_pretrain.stderr)
             self.assertEqual(list(work.glob('.pretrain-path.*')), [])
+
+            removed = subprocess.run(
+                ["bash", str(ROOT / "run.sh"), "--stage", "predict", "--dataset", dataset,
+                 "--work-dir", str(work), "--python", str(fake_python),
+                 "--item-metadata-csv", "items.csv"],
+                cwd=work, capture_output=True, text=True,
+            )
+            self.assertEqual(removed.returncode, 2)
+            self.assertIn('Unknown option: --item-metadata-csv', removed.stderr)
 
             env_file = work / '.env'
             env_file.touch()

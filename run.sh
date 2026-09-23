@@ -13,17 +13,12 @@ Options:
   --input-csv FILE     Interaction CSV for fetch (alternative to --input-table)
   --input-table NAME   ODPS interaction table for fetch
   --input-query-file FILE  ODPS SQL for fetch (alternative to table)
-  --item-metadata-csv FILE   CSV with item_id, category_id for prediction
-  --eligible-items-csv FILE CSV with item_id for prediction
-  --item-metadata-table NAME ODPS item/category table for prediction
-  --eligible-items-table NAME ODPS eligible item table for prediction
   --work-dir DIR       Raw data, processed data, checkpoints, and results (default: project outputs/)
   --plm-path DIR       Local text encoder directory (default: ./bert-base-uncased)
   --max-seq-length N   Recent interactions retained per user in preprocess (default: 50; 3-100)
   --env-file FILE      ODPS connection file (default: project .env)
   --python EXECUTABLE  Python executable (default: python3)
   --top-k NUMBER       Number of recommended items (default: 50)
-  --output-table NAME  Optional ODPS result table; predictions are always saved as CSV
   --resume-checkpoint FILE     Checkpoint for resuming a standalone pretrain stage
   --pretrained-checkpoint FILE  Weight file for a standalone finetune stage
   --finetuned-checkpoint FILE   Weight file for a standalone predict stage
@@ -37,24 +32,19 @@ dataset=
 input_csv=
 input_table=
 input_query_file=
-item_metadata_csv=
-eligible_items_csv=
-item_metadata_table=
-eligible_items_table=
 work_dir=$repo_dir/outputs
 plm_path=$repo_dir/bert-base-uncased
 max_seq_length=50
 env_file=$repo_dir/.env
 python=python3
 top_k=50
-output_table=
 resume_checkpoint=
 pretrained_checkpoint=
 finetuned_checkpoint=
 
 while (($#)); do
   case "$1" in
-    --stage|--dataset|--input-csv|--input-table|--input-query-file|--item-metadata-csv|--eligible-items-csv|--item-metadata-table|--eligible-items-table|--work-dir|--plm-path|--max-seq-length|--env-file|--python|--top-k|--output-table|--resume-checkpoint|--pretrained-checkpoint|--finetuned-checkpoint)
+    --stage|--dataset|--input-csv|--input-table|--input-query-file|--work-dir|--plm-path|--max-seq-length|--env-file|--python|--top-k|--resume-checkpoint|--pretrained-checkpoint|--finetuned-checkpoint)
       if (($# < 2)); then echo "Missing value for $1" >&2; exit 2; fi
       case "$1" in
         --stage) stage=$2 ;;
@@ -62,17 +52,12 @@ while (($#)); do
         --input-csv) input_csv=$2 ;;
         --input-table) input_table=$2 ;;
         --input-query-file) input_query_file=$2 ;;
-        --item-metadata-csv) item_metadata_csv=$2 ;;
-        --eligible-items-csv) eligible_items_csv=$2 ;;
-        --item-metadata-table) item_metadata_table=$2 ;;
-        --eligible-items-table) eligible_items_table=$2 ;;
         --work-dir) work_dir=$2 ;;
         --plm-path) plm_path=$2 ;;
         --max-seq-length) max_seq_length=$2 ;;
         --env-file) env_file=$2 ;;
         --python) python=$2 ;;
         --top-k) top_k=$2 ;;
-        --output-table) output_table=$2 ;;
         --resume-checkpoint) resume_checkpoint=$2 ;;
         --pretrained-checkpoint) pretrained_checkpoint=$2 ;;
         --finetuned-checkpoint) finetuned_checkpoint=$2 ;;
@@ -111,13 +96,6 @@ if [[ "$stage" == all || "$stage" == fetch ]]; then
     exit 2
   fi
 fi
-if [[ "$stage" == all || "$stage" == predict ]]; then
-  if [[ -z "$item_metadata_csv" && -z "$item_metadata_table" ]] || [[ -z "$eligible_items_csv" && -z "$eligible_items_table" ]] ||
-     [[ -n "$item_metadata_csv" && -n "$item_metadata_table" ]] || [[ -n "$eligible_items_csv" && -n "$eligible_items_table" ]]; then
-    echo "Prediction requires one metadata source and one eligible-item source (CSV or ODPS table)" >&2
-    exit 2
-  fi
-fi
 if [[ ! "$top_k" =~ ^[1-9][0-9]*$ ]]; then
   echo "--top-k must be a positive integer" >&2
   exit 2
@@ -142,20 +120,14 @@ if [[ ( "$stage" == all || "$stage" == fetch ) && -n "$input_csv" && ! -f "$inpu
   echo "Interaction input file does not exist" >&2
   exit 2
 fi
-if [[ ( "$stage" == all || "$stage" == predict ) && -n "$item_metadata_csv" && ! -f "$item_metadata_csv" ]] ||
-   [[ ( "$stage" == all || "$stage" == predict ) && -n "$eligible_items_csv" && ! -f "$eligible_items_csv" ]]; then
-  echo "Prediction metadata CSV does not exist" >&2
-  exit 2
-fi
-if [[ ( "$stage" == all || "$stage" == fetch ) && ( -n "$input_table" || -n "$input_query_file" ) ]] ||
-   [[ ( "$stage" == all || "$stage" == predict ) && ( -n "$item_metadata_table" || -n "$eligible_items_table" || -n "$output_table" ) ]]; then
+if [[ ( "$stage" == all || "$stage" == fetch ) && ( -n "$input_table" || -n "$input_query_file" ) ]]; then
   if [[ ! -f "$env_file" ]]; then
     echo "ODPS credentials file does not exist: $env_file" >&2
     exit 2
   fi
   env_file=$(cd "$(dirname "$env_file")" && pwd)/$(basename "$env_file")
 fi
-for source in input_csv input_query_file item_metadata_csv eligible_items_csv; do
+for source in input_csv input_query_file; do
   if [[ -n "${!source}" ]]; then
     printf -v "$source" '%s/%s' "$(cd "$(dirname "${!source}")" && pwd)" "$(basename "${!source}")"
   fi
@@ -272,12 +244,8 @@ predict() {
     exit 1
   fi
   mkdir -p "$result_dir"
-  local sources=(--data-path "$data_dir")
-  if [[ -n "$item_metadata_csv" ]]; then sources+=(--item-metadata-csv "$item_metadata_csv"); else sources+=(--item-metadata-table "$item_metadata_table"); fi
-  if [[ -n "$eligible_items_csv" ]]; then sources+=(--eligible-items-csv "$eligible_items_csv"); else sources+=(--eligible-items-table "$eligible_items_table"); fi
-  if [[ -n "$item_metadata_table" || -n "$eligible_items_table" || -n "$output_table" ]]; then sources+=(--env-file "$env_file"); fi
-  if [[ -n "$output_table" ]]; then sources+=(--output-table "$output_table"); fi
-  "$python" predict.py -d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir" "${sources[@]}"
+  "$python" predict.py -d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir" \
+    --data-path "$data_dir"
 }
 
 stage_info() {
