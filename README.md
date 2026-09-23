@@ -9,7 +9,7 @@ run.sh                         完整流水线与独立阶段入口
 unisrec.py                     模型定义
 pretrain.py                    预训练入口
 finetune.py                    微调入口
-predict.py                     预测及可选的 ODPS 写表
+predict.py                     纯模型 TopK 推理与 CSV 输出
 recbole_data/                  RecBole 数据集、加载器、数据增强
 data_pipeline/raw/             CSV 标准化与 ODPS 取数
 data_pipeline/preprocessing/   交互清洗、原子文件和文本向量生成
@@ -37,15 +37,6 @@ outputs/                       默认产物目录，由 Git 忽略
 
 本项目早期 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式，无需修改原 ODPS 表。上游 UniSRec 的原始数据预处理因数据集而异；本项目预处理后生成的 RecBole 原子文件使用 `user_id`、`item_id_list`、`item_id` 等模型输入字段，以及商品文本向量文件。预处理跳过原始字段中有空值的行；日期需要是 `YYYY-MM-DD`。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
 
-### 预测商品信息
-
-预测阶段还需要两份数据，可以分别来自 CSV 或 ODPS 表：
-
-- 商品品类：`item_id,category_id`，用于每个品类最多保留 2 个商品的现有打散规则。
-- 可推荐商品：`item_id`，用于筛选当前有效的商品。
-
-CSV 标识符按字符串读取，前导零会保留。ODPS 表也应提供这些列名；不同生产表结构可建立视图，或在导出 CSV 时改列名。ODPS 表名均在运行时传入，项目不依赖固定表名。
-
 ## 环境与目录
 
 安装 `requirements.txt`，并准备本地文本编码器目录。文件中的 PyTorch 构建面向 CUDA 11.6，应使用匹配的运行环境。ODPS 模式在项目根目录的 `.env` 中读取连接参数，也可用 `--env-file` 指定其他文件；`.env` 已被 Git 忽略：
@@ -68,9 +59,7 @@ outputs/
 │   └── index2user.json / index2item.json
 ├── checkpoints/pretrain/*.pth
 ├── checkpoints/finetune/UniSRec-<dataset>-finetuned.pth
-└── results/
-    ├── <dataset>-details-<date>.csv
-    └── <dataset>-recommendations.csv
+└── results/<dataset>-recommendations.csv
 ```
 
 在 PAI 可视化建模组件中，用 `--work-dir "$PAI_OUTPUT_DIR"` 指向组件实际挂载的输出目录；`PAI_OUTPUT_DIR` 是示例变量，需由部署环境设置。所有阶段使用相同工作目录。凭据与文本编码器也可分别通过 `--env-file`、`--plm-path` 指向部署环境的实际位置，仓库不包含固定挂载路径。
@@ -87,7 +76,7 @@ bash run.sh --stage fetch \
   --work-dir "$PAI_OUTPUT_DIR"
 ```
 
-该命令生成 `$PAI_OUTPUT_DIR/raw/catalog.csv`。`--work-dir` 是后续预处理、训练和预测共用的目录，不只是下载目录。`fetch` 不需要 `--plm-path` 或预测商品信息参数。
+该命令生成 `$PAI_OUTPUT_DIR/raw/catalog.csv`。`--work-dir` 是后续预处理、训练和预测共用的目录，不只是下载目录。`fetch` 不需要 `--plm-path` 或预测参数。
 
 ## 完整流程
 
@@ -96,16 +85,15 @@ bash run.sh --stage fetch \
 ```bash
 bash run.sh --stage all --dataset catalog \
   --input-csv /path/to/interactions.csv \
-  --item-metadata-csv /path/to/item_metadata.csv \
-  --eligible-items-csv /path/to/eligible_items.csv \
   --plm-path /path/to/text_encoder \
   --max-seq-length 50 \
+  --top-k 50 \
   --work-dir /path/to/work_dir
 ```
 
-ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_table`，或使用 `--input-query-file /path/to/query.sql`；预测数据可用 `--item-metadata-table your_metadata_table` 和 `--eligible-items-table your_eligible_items_table`。如需将结果写回 ODPS，传入 `--output-table your_result_table`，并用 `--env-file /path/to/.env` 指向连接配置。CSV 与 ODPS 商品信息可以分别选择，不要求来自同一种存储。
+ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_table`，或使用 `--input-query-file /path/to/query.sql`，并用 `--env-file /path/to/.env` 指向连接配置。预测阶段只读取预处理数据和微调模型，不连接 ODPS。
 
-查询文件必须返回交互数据契约中的五列，历史字段也受支持。需要原来的近期交互窗口时，可在 SQL 中继续使用日期条件。请审查实际 SQL 和 ODPS 目标表；写表时会删除已有同名表并重建。
+查询文件必须返回交互数据契约中的五列，历史字段也受支持。需要原来的近期交互窗口时，可在 SQL 中继续使用日期条件。请审查实际 SQL。
 
 `bash run.sh --help` 列出所有参数。省略 `--stage` 等同于 `--stage all`。
 
@@ -131,8 +119,6 @@ mkdir -p "$WORK_DIR/logs"
 
 nohup bash run.sh --stage all --dataset catalog \
   --input-csv /path/to/interactions.csv \
-  --item-metadata-csv /path/to/item_metadata.csv \
-  --eligible-items-csv /path/to/eligible_items.csv \
   --plm-path /path/to/text_encoder \
   --max-seq-length 50 \
   --work-dir "$WORK_DIR" \
@@ -160,8 +146,6 @@ pgrep -af "run.sh|prepare_interactions.py|preprocess.py|pretrain.py|finetune.py|
 `nohup` 只避免进程随 SSH 会话断开而退出，不能防止 Pod 重启、删除、驱逐、平台任务超时、
 OOM 或节点故障。不要为同一个数据集和工作目录同时启动相同阶段，否则可能同时写入同名文件。
 
-迁移已有 ODPS 部署时，需要将原商品信息字段映射为 `item_id,category_id`，将可推荐商品字段映射为 `item_id`。可选结果表现在使用 `user_id,item_id,score`，原先依赖其他列名的下游任务需要同步调整。原来写死的试验用户复制规则已移除，推荐结果只包含真实输入用户。
-
 ## 数据流与输出
 
 ```mermaid
@@ -175,15 +159,12 @@ flowchart LR
     F --> Y[W/checkpoints/finetune/UniSRec-D-finetuned.pth]
     C -->|predict.inter + feat1CLS| R[predict]
     Y --> R
-    M[商品品类 + 可推荐商品 CSV / ODPS] --> R
     R --> Z[W/results/D-recommendations.csv]
-    R --> Q[W/results/D-details-date.csv]
-    R -. --output-table .-> O[可选 ODPS 结果表]
 ```
 
-图中 `D` 是 `--dataset` 的值。现有用户和商品交互次数过滤后，预处理对每位用户保留最近 `--max-seq-length` 次交互（默认 50，范围 3–100）。训练使用除最后两次外的交互，倒数第二次作为验证目标，最后一次作为测试目标；`predict.inter` 使用保留的完整序列供生产预测。预测从全量评分中最多取 800 个候选，按有效商品和品类筛选，最后每用户保留至多 `--top-k` 个；写推荐明细时仅保留历史序列最长的前 150000 名用户。这些规则属于当前业务逻辑。
+图中 `D` 是 `--dataset` 的值。现有用户和商品交互次数过滤后，预处理对每位用户保留最近 `--max-seq-length` 次交互（默认 50，范围 3–100）。训练使用除最后两次外的交互，倒数第二次作为验证目标，最后一次作为测试目标；`predict.inter` 使用保留的完整序列供生产预测。预测为全部预测用户计算全量商品分数，屏蔽 padding 和用户完整输入序列中的历史商品，然后按分数降序直接选择最多 `--top-k` 个商品。
 
-`<dataset>-recommendations.csv` 和可选 ODPS 表采用相同的逐条推荐格式：`user_id,item_id,score`。`<dataset>-details-<date>.csv` 则用于检查预测，列为 `user_id,history_item_ids,target_item_id,recommended_item_ids,recommendation_scores`；其中列表列是 JSON 数组字符串。生产预测没有已知目标商品，`target_item_id` 留空。结果文件以当前数据集命名。
+预测只生成 `<dataset>-recommendations.csv`，采用逐条推荐格式 `user_id,item_id,score`。每位用户的结果按模型分数降序写入；可推荐的未交互商品少于 `--top-k` 时，该用户的输出行数会相应减少。
 
 ## 各阶段 Bash 命令与参数
 
@@ -223,8 +204,6 @@ cd "$PROJECT_DIR"
 bash run.sh --stage all \
   --dataset catalog \
   --input-csv /path/to/interactions.csv \
-  --item-metadata-csv /path/to/item_metadata.csv \
-  --eligible-items-csv /path/to/eligible_items.csv \
   --plm-path /path/to/text_encoder \
   --max-seq-length 50 \
   --top-k 50 \
@@ -241,15 +220,10 @@ bash run.sh --stage all \
 | `--input-csv FILE` | 三选一 | 无 | 从已有交互 CSV 读取数据。必须与 `--input-table`、`--input-query-file` 三选一。 |
 | `--input-table NAME` | 三选一 | 无 | 读取 ODPS 交互表的全部行。必须与另外两种交互来源三选一。 |
 | `--input-query-file FILE` | 三选一 | 无 | 执行文件中的 ODPS SQL。适合日期过滤、字段别名和复杂查询。 |
-| `--item-metadata-csv FILE` | 二选一 | 无 | 商品品类 CSV，必须包含 `item_id,category_id`。与 `--item-metadata-table` 二选一。 |
-| `--item-metadata-table NAME` | 二选一 | 无 | ODPS 商品品类表。与 `--item-metadata-csv` 二选一。 |
-| `--eligible-items-csv FILE` | 二选一 | 无 | 可推荐商品 CSV，必须包含 `item_id`。与 `--eligible-items-table` 二选一。 |
-| `--eligible-items-table NAME` | 二选一 | 无 | ODPS 可推荐商品表。与 `--eligible-items-csv` 二选一。 |
 | `--plm-path DIR` | 否 | 项目内 `bert-base-uncased/` | 本地文本编码器目录；目录必须存在。 |
 | `--max-seq-length N` | 否 | `50` | 每位用户保留的最近交互数，必须是 `3–100` 的整数。 |
 | `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
-| `--env-file FILE` | 条件使用 | 项目根目录 `.env` | 任一输入来自 ODPS，或指定 `--output-table` 时读取。文件必须存在。纯 CSV 流程无需指定。 |
-| `--output-table NAME` | 否 | 不写 ODPS | 除 CSV 结果外，再将逐条推荐写入该 ODPS 表。已有同名表会被删除并重建。 |
+| `--env-file FILE` | ODPS 输入使用 | 项目根目录 `.env` | `--input-table` 或 `--input-query-file` 模式的连接配置。纯 CSV 流程与预测阶段不读取。 |
 | `--work-dir DIR` | 否 | 项目内 `outputs/` | 保存所有中间数据、检查点和预测结果。 |
 | `--python EXECUTABLE` | 否 | `python3` | 全部 Python 阶段使用的解释器。 |
 
@@ -263,7 +237,6 @@ bash run.sh --stage all \
 <work-dir>/checkpoints/pretrain/*.pth
 <work-dir>/checkpoints/finetune/UniSRec-<dataset>-finetuned.pth
 <work-dir>/results/<dataset>-recommendations.csv
-<work-dir>/results/<dataset>-details-<date>.csv
 ```
 
 ### 1. fetch：准备标准交互 CSV
@@ -451,13 +424,13 @@ bash run.sh --stage finetune \
 
 ### 5. predict：生成推荐结果
 
-#### CSV 商品信息示例
+预测阶段只执行模型推理：读取预处理产生的完整用户序列和商品文本向量，加载微调模型，为全部预测用户生成 TopK 结果并写入一份 CSV。
+
+#### 执行示例
 
 ```bash
 bash run.sh --stage predict \
   --dataset catalog \
-  --item-metadata-csv /path/to/item_metadata.csv \
-  --eligible-items-csv /path/to/eligible_items.csv \
   --finetuned-checkpoint "$WORK_DIR/checkpoints/finetune/UniSRec-catalog-finetuned.pth" \
   --top-k 50 \
   --work-dir "$WORK_DIR" \
@@ -470,18 +443,12 @@ bash run.sh --stage predict \
 | --- | --- | --- | --- |
 | `--stage predict` | 是 | 无 | 只执行预测。 |
 | `--dataset NAME` | 是 | 无 | 指定预处理数据集和结果文件名前缀。 |
-| `--item-metadata-csv FILE` | 二选一 | 无 | 商品品类 CSV，包含 `item_id,category_id`。与 `--item-metadata-table` 二选一。 |
-| `--item-metadata-table NAME` | 二选一 | 无 | ODPS 商品品类表。与 `--item-metadata-csv` 二选一。 |
-| `--eligible-items-csv FILE` | 二选一 | 无 | 可推荐商品 CSV，包含 `item_id`。与 `--eligible-items-table` 二选一。 |
-| `--eligible-items-table NAME` | 二选一 | 无 | ODPS 可推荐商品表。与 `--eligible-items-csv` 二选一。 |
 | `--finetuned-checkpoint FILE` | 否 | `DIR/checkpoints/finetune/UniSRec-NAME-finetuned.pth` | 指定微调模型；省略时使用工作目录中的默认文件。 |
 | `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
-| `--output-table NAME` | 否 | 不写 ODPS | 额外写入 ODPS 结果表；已有同名表会被删除并重建。CSV 始终生成。 |
-| `--env-file FILE` | 条件使用 | 项目根目录 `.env` | 使用任一 ODPS 商品表或 `--output-table` 时读取。 |
 | `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取预处理产物和默认模型，结果写入 `DIR/results/`。 |
-| `--python EXECUTABLE` | 否 | `python3` | 执行模型推理及可选 ODPS 写表。 |
+| `--python EXECUTABLE` | 否 | `python3` | 执行模型推理。GPU 环境建议使用 Conda Python 的绝对路径。 |
 
-每组商品来源必须且只能选择一种；商品品类和可推荐商品可以分别使用 CSV 或 ODPS，不要求来源类型相同。
+`predict` 会屏蔽 padding 商品和每位用户输入序列中的全部历史商品，再按模型分数降序写出最多 `--top-k` 条结果。未交互商品不足时，该用户的输出可能少于 `--top-k` 条。
 
 #### 前置文件
 
@@ -495,27 +462,16 @@ bash run.sh --stage predict \
 <finetuned-checkpoint>
 ```
 
-#### ODPS 商品信息与结果表示例
-
-```bash
-bash run.sh --stage predict \
-  --dataset catalog \
-  --item-metadata-table your_metadata_table \
-  --eligible-items-table your_eligible_items_table \
-  --output-table your_result_table \
-  --env-file /path/to/.env \
-  --finetuned-checkpoint "$WORK_DIR/checkpoints/finetune/UniSRec-catalog-finetuned.pth" \
-  --top-k 50 \
-  --work-dir "$WORK_DIR" \
-  --python "$PYTHON_BIN"
-```
-
 #### 输出
 
 ```text
 <work-dir>/results/<dataset>-recommendations.csv
-<work-dir>/results/<dataset>-details-<date>.csv
-<output-table>  # 仅指定 --output-table 时写入
+```
+
+文件只包含三列：
+
+```text
+user_id,item_id,score
 ```
 
 ### Bash 参数与 YAML 超参数的边界
