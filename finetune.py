@@ -3,7 +3,7 @@ import os
 import torch
 from recbole.config import Config
 from recbole.data import data_preparation
-from recbole.utils import init_seed, get_trainer
+from recbole.utils import init_seed, init_logger, get_trainer
 
 from unisrec import UniSRec
 from recbole_data.dataset import UniSRecDataset
@@ -16,6 +16,7 @@ def finetune(dataset, pretrained_file, fix_enc=True, **kwargs):
     # 配置初始化
     config = Config(model=UniSRec, dataset=dataset, config_file_list=props, config_dict=kwargs)
     init_seed(config['seed'], config['reproducibility'])
+    init_logger(config)
     dataset = UniSRecDataset(config)
 
 
@@ -42,7 +43,7 @@ def finetune(dataset, pretrained_file, fix_enc=True, **kwargs):
     
     # 模型训练
     best_valid_score, best_valid_result = trainer.fit(
-        train_data, valid_data, saved=True, show_progress=True # config['show_progress']
+        train_data, valid_data, saved=True, show_progress=config['show_progress']
     )
     
     return config['model'], config['dataset'], {
