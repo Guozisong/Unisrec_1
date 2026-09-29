@@ -1,25 +1,28 @@
-data_path: 'outputs/downstream/'
-benchmark_filename: [train, valid, test]
-alias_of_item_id: [item_id_list]
+# 数据读取
+data_path: 'outputs/downstream/'               # 预处理产物的父目录
+benchmark_filename: [train, valid, test]       # 要读取的 .inter 文件后缀及顺序
+alias_of_item_id: [item_id_list]               # 将历史商品序列关联到商品 ID 字段
 load_col:
-  inter: [user_id, item_id_list, item_id]
-train_neg_sample_args: ~
-unisrec_transform: ~
+  inter: [user_id, item_id_list, item_id]      # 从 .inter 文件读取的列
+train_neg_sample_args: ~                       # 训练时的负采样配置
+unisrec_transform: ~                           # 数据加载时使用的序列变换类型
 
-MAX_ITEM_LIST_LENGTH: 100
-topk: [50]
-metrics: [HIT]
-valid_metric: HIT@50
-eval_batch_size: 1024
-eval_step: 5
-stopping_step: 10
+# 序列长度与评估
+MAX_ITEM_LIST_LENGTH: 100                     # 模型可读取的历史序列上限
+topk: [50]                                    # 评估指标的推荐列表长度
+metrics: [HIT]                                # 要计算的评估指标
+valid_metric: HIT@50                          # 选择最佳模型所依据的验证指标
+eval_batch_size: 1024                         # 评估批量大小
+eval_step: 5                                  # 两次验证评估之间的训练轮数
+stopping_step: 10                             # 早停允许的连续无提升评估次数
 
-train_stage: transductive_ft
-epochs: 20
-train_batch_size: 1024
-weight_decay: 0.0
-shuffle: True
+# 微调优化
+train_stage: transductive_ft                  # 模型的训练阶段和微调方式
+epochs: 20                                   # 最多训练轮次
+train_batch_size: 1024                        # 训练批量大小
+weight_decay: 0.0                             # 权重衰减系数
+shuffle: True                                # 是否打乱训练样本
 
-learning_rate: 0.002
+learning_rate: 0.002                          # 学习率
 
-show_progress: False
+show_progress: False                          # 是否显示训练进度

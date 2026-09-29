@@ -78,7 +78,8 @@ class PipelineTest(unittest.TestCase):
                 ("fetch", ["--input-csv", str(input_csv)], "prepare_interactions.py"),
                 ("preprocess", ["--plm-path", str(encoder), "--max-seq-length", "40"], "preprocess.py"),
                 ("pretrain", [], "pretrain.py"),
-                ("finetune", ["--pretrained-checkpoint", str(work / "checkpoints" / "pretrain" / "pretrained.pth")], "finetune.py"),
+                ("finetune", ["--pretrained-checkpoint", str(work / "checkpoints" / "pretrain" / "pretrained.pth"),
+                              "--no-fix-encoder"], "finetune.py"),
                 ("predict", ["--finetuned-checkpoint", str(work / "checkpoints" / "finetune" / "UniSRec-sample-finetuned.pth")], "predict.py"),
             ]
             for stage, options, expected in single_stages:
@@ -99,6 +100,8 @@ class PipelineTest(unittest.TestCase):
                     self.assertIn(f'stage={stage} COMPLETE', single.stdout)
                     if stage == 'preprocess':
                         self.assertIn('--max_seq_length 40', log.read_text())
+                    if stage == 'finetune':
+                        self.assertIn('--no-fix-encoder', log.read_text())
 
             resume_checkpoint = work / 'checkpoints' / 'pretrain' / 'epoch-12.pth'
             resume_checkpoint.touch()

@@ -22,6 +22,7 @@ Options:
   --resume-checkpoint FILE     Checkpoint for resuming a standalone pretrain stage
   --pretrained-checkpoint FILE  Weight file for a standalone finetune stage
   --finetuned-checkpoint FILE   Weight file for a standalone predict stage
+  --no-fix-encoder    Train the Transformer encoder during finetune (default: frozen)
   -h, --help           Show this help
 EOF
 }
@@ -41,6 +42,7 @@ top_k=50
 resume_checkpoint=
 pretrained_checkpoint=
 finetuned_checkpoint=
+no_fix_encoder=false
 
 while (($#)); do
   case "$1" in
@@ -63,6 +65,7 @@ while (($#)); do
         --finetuned-checkpoint) finetuned_checkpoint=$2 ;;
       esac
       shift 2 ;;
+    --no-fix-encoder) no_fix_encoder=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -82,6 +85,10 @@ if [[ -n "$pretrained_checkpoint" && "$stage" != finetune ]]; then
 fi
 if [[ -n "$finetuned_checkpoint" && "$stage" != predict ]]; then
   echo "--finetuned-checkpoint is only used with --stage predict" >&2
+  exit 2
+fi
+if [[ "$no_fix_encoder" == true && "$stage" != finetune && "$stage" != all ]]; then
+  echo "--no-fix-encoder is only used with --stage finetune or --stage all" >&2
   exit 2
 fi
 if [[ ! "$dataset" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
@@ -154,6 +161,31 @@ if [[ "$stage" == predict && -n "$finetuned_checkpoint" ]]; then
   finetuned_checkpoint=$(cd "$(dirname "$finetuned_checkpoint")" && pwd)/$(basename "$finetuned_checkpoint")
 fi
 
+# TKE's SSH sidecar enters the main container's filesystem but retains its own
+# smaller memory cgroup. Move this shell before launching memory-heavy stages.
+if [[ -n "${MAIN_ROOT:-}" ]]; then
+  if [[ ! "$MAIN_ROOT" =~ ^/proc/([0-9]+)/root$ ]]; then
+    echo "Invalid MAIN_ROOT from the SSH sidecar: $MAIN_ROOT" >&2
+    exit 1
+  fi
+  main_pid=${BASH_REMATCH[1]}
+  main_cgroup=$(sed -n 's/^0:://p' "/proc/$main_pid/cgroup")
+  current_cgroup=$(sed -n 's/^0:://p' /proc/self/cgroup)
+  if [[ -z "$main_cgroup" || -z "$current_cgroup" ]]; then
+    echo "Cannot read container cgroups; refusing to run inside the SSH sidecar" >&2
+    exit 1
+  fi
+  if [[ "$current_cgroup" != "$main_cgroup" ]]; then
+    sshd_pid=$(pgrep -o sshd) || { echo "Cannot locate the SSH sidecar" >&2; exit 1; }
+    target="/proc/$sshd_pid/root/sys/fs/cgroup$main_cgroup/cgroup.procs"
+    if [[ ! -w "$target" ]] || ! printf '%s\n' "$BASHPID" > "$target"; then
+      echo "Cannot enter the main container cgroup; refusing to run inside the SSH sidecar" >&2
+      exit 1
+    fi
+    echo "Using main container memory cgroup"
+  fi
+fi
+
 work_dir=$(mkdir -p "$work_dir" && cd "$work_dir" && pwd)
 raw_dir=$work_dir/raw
 data_dir=$work_dir/downstream
@@ -220,10 +252,14 @@ pretrain() {
 
 finetune() {
   local checkpoint=$1
+  local args=(-d "$dataset" -p "$checkpoint" --data-path "$data_dir"
+    --checkpoint-dir "$finetune_dir")
+  if [[ "$no_fix_encoder" == true ]]; then
+    args+=(--no-fix-encoder)
+  fi
   check_data train.inter valid.inter test.inter feat1CLS
   mkdir -p "$finetune_dir"
-  "$python" finetune.py -d "$dataset" -p "$checkpoint" --data-path "$data_dir" \
-    --checkpoint-dir "$finetune_dir"
+  "$python" finetune.py "${args[@]}"
   finetuned_file=$finetune_dir/UniSRec-${dataset}-finetuned.pth
   if [[ ! -f "$finetuned_file" ]]; then
     echo "Fine tuning did not produce $finetuned_file" >&2

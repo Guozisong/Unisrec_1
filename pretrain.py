@@ -71,7 +71,7 @@ def pretrain(dataset, resume_checkpoint=None, **kwargs):
         )
 
     # 模型训练
-    trainer.pretrain(pretrain_data, show_progress=True)
+    trainer.pretrain(pretrain_data, show_progress=False)
 
     return config['model'], config['dataset'], trainer.saved_model_file
 

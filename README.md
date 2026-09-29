@@ -146,6 +146,28 @@ pgrep -af "run.sh|prepare_interactions.py|preprocess.py|pretrain.py|finetune.py|
 `nohup` 只避免进程随 SSH 会话断开而退出，不能防止 Pod 重启、删除、驱逐、平台任务超时、
 OOM 或节点故障。不要为同一个数据集和工作目录同时启动相同阶段，否则可能同时写入同名文件。
 
+### 在 TKE Pod 的 VS Code SSH 终端运行
+
+TKE 的 SSH sidecar 和训练主容器可能使用不同的内存限额。通过 VS Code SSH 终端执行时，
+`run.sh` 会根据平台提供的 `MAIN_ROOT` 自动将自身切换到主容器的内存 cgroup，再启动阶段进程；
+若无法切换，会报错退出，避免在 SSH sidecar 的较小内存限额下启动训练。
+
+以下示例将 W&B 指标保存在 Pod 本地，适用于未配置 W&B API Key 的非交互运行：
+
+```bash
+cd /workspace/Unisrec_1
+mkdir -p output/logs
+WANDB_MODE=offline nohup bash run.sh --stage pretrain \
+  --dataset lianhua \
+  --work-dir /workspace/Unisrec_1/output \
+  --python /workspace/miniconda3/envs/Unisrec/bin/python3 \
+  > output/logs/pretrain.out 2>&1 < /dev/null &
+echo $!
+```
+
+`WANDB_MODE=offline` 仅影响本次命令的 W&B 日志模式，不修改 YAML 配置。查看进度时，可用
+`tail -c 10000 output/logs/pretrain.out | tr '\r' '\n' | tail -n 5`，避免进度条的回车符导致整段日志挤在一行。
+
 ## 数据流与输出
 
 ```mermaid
@@ -222,6 +244,7 @@ bash run.sh --stage all \
 | `--input-query-file FILE` | 三选一 | 无 | 执行文件中的 ODPS SQL。适合日期过滤、字段别名和复杂查询。 |
 | `--plm-path DIR` | 否 | 项目内 `bert-base-uncased/` | 本地文本编码器目录；目录必须存在。 |
 | `--max-seq-length N` | 否 | `50` | 每位用户保留的最近交互数，必须是 `3–100` 的整数。 |
+| `--no-fix-encoder` | 否 | 不指定 | 在流水线的微调阶段更新 Transformer 编码器和位置嵌入；不指定时冻结这两部分参数。 |
 | `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
 | `--env-file FILE` | ODPS 输入使用 | 项目根目录 `.env` | `--input-table` 或 `--input-query-file` 模式的连接配置。纯 CSV 流程与预测阶段不读取。 |
 | `--work-dir DIR` | 否 | 项目内 `outputs/` | 保存所有中间数据、检查点和预测结果。 |
@@ -392,6 +415,7 @@ bash run.sh --stage pretrain \
 bash run.sh --stage finetune \
   --dataset catalog \
   --pretrained-checkpoint "$WORK_DIR/checkpoints/pretrain/UniSRec-catalog-50.pth" \
+  --no-fix-encoder \
   --work-dir "$WORK_DIR" \
   --python "$PYTHON_BIN"
 ```
@@ -403,6 +427,7 @@ bash run.sh --stage finetune \
 | `--stage finetune` | 是 | 无 | 只执行微调。 |
 | `--dataset NAME` | 是 | 无 | 指定预处理数据集和微调模型文件名。 |
 | `--pretrained-checkpoint FILE` | 是 | 无 | 预训练检查点；文件必须存在。独立微调不会自动推断该路径。 |
+| `--no-fix-encoder` | 否 | 不指定 | 无值开关。指定后，微调时更新 Transformer 编码器和位置嵌入；不指定时冻结这两部分参数。 |
 | `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取 `DIR/downstream/<dataset>/`，写入 `DIR/checkpoints/finetune/`。 |
 | `--python EXECUTABLE` | 否 | `python3` | 执行微调。 |
 

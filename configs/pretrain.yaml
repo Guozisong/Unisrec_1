@@ -1,24 +1,21 @@
-data_path: 'outputs/downstream/'
-benchmark_filename: [train]
-alias_of_item_id: [item_id_list]
+# 数据读取
+data_path: 'outputs/downstream/'               # 预处理产物的父目录
+benchmark_filename: [train]                    # 要读取的 .inter 文件后缀及顺序
+alias_of_item_id: [item_id_list]               # 将历史商品序列关联到商品 ID 字段
 load_col:
-  inter: [user_id, item_id_list, item_id]
-train_neg_sample_args: ~
-unisrec_transform: plm_emb
+  inter: [user_id, item_id_list, item_id]      # 从 .inter 文件读取的列
+train_neg_sample_args: ~                       # 训练时的负采样配置
+unisrec_transform: plm_emb                     # 数据加载时使用的序列变换类型
 
-train_stage: pretrain
+train_stage: pretrain                          # 模型的训练阶段
 
-MAX_ITEM_LIST_LENGTH: 100
-pretrain_epochs: 100
-save_step: 1
-train_batch_size: 1280
-learning_rate: 0.001
+MAX_ITEM_LIST_LENGTH: 50                      # 模型可读取的历史序列上限
+pretrain_epochs: 100                          # 预训练轮次
+save_step: 1                                  # 检查点保存间隔（训练轮数）
+train_batch_size: 1280                        # 训练批量大小
+learning_rate: 0.001                          # 学习率
 
-
-log_wandb: True
-logging_type: wandb
-wandb_project: unisrec_project_pretrain
-
-
-
-
+# 实验日志
+log_wandb: True                               # 是否启用 W&B 日志
+logging_type: wandb                           # 日志后端
+wandb_project: unisrec_project_pretrain       # W&B 项目名
