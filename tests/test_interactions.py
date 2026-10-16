@@ -40,6 +40,18 @@ class InteractionContractTest(unittest.TestCase):
                 'u1,001,2,2026-01-01,Item A',
             ])
 
+    def test_prediction_input_requires_only_user_item_and_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.csv'
+            source.write_text('event_time,item_id,user_id,extra\n'
+                              '1791874162374,001,new-user,ignored\n')
+            target = Path(directory) / 'prediction.csv'
+            prepare_csv(source, target, prediction_only=True)
+            self.assertEqual(target.read_text().splitlines(), [
+                'user_id,item_id,event_time',
+                'new-user,001,1791874162374',
+            ])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -37,6 +37,8 @@ outputs/                       默认产物目录，由 Git 忽略
 
 本项目早期 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式，无需修改原 ODPS 表。上游 UniSRec 的原始数据预处理因数据集而异；本项目预处理后生成的 RecBole 原子文件使用 `user_id`、`item_id_list`、`item_id` 等模型输入字段，以及商品文本向量文件。预处理跳过原始字段中有空值的行；`event_time` 支持 13 位毫秒时间戳或 `YYYY-MM-DD` 日期，其他格式的行会被跳过。日期按运行环境的本地时区转换为时间戳。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
 
+微调后的重复预测只需每位待预测用户截至当前的完整交互历史。此时输入至少包含 `user_id,item_id,event_time`，可有额外列；历史字段 `user_id,prod_id,dt` 也可接入。`event_value` 和 `item_text` 不参与重复预测。输入中的商品必须属于微调时的固定商品集合；未知商品或无效时间的交互会被跳过并计数，用户没有有效历史时不会输出推荐。
+
 ## 环境与目录
 
 安装 `requirements.txt`，并准备本地文本编码器目录。文件中的 PyTorch 构建面向 CUDA 11.6，应使用匹配的运行环境。ODPS 模式在项目根目录的 `.env` 中读取连接参数，也可用 `--env-file` 指定其他文件；`.env` 已被 Git 忽略：
@@ -180,6 +182,9 @@ flowchart LR
     X --> F
     F --> Y[W/checkpoints/finetune/UniSRec-D-finetuned.pth]
     C -->|predict.inter + feat1CLS| R[predict]
+    N[新的完整用户历史 CSV / ODPS] -->|仅标准化 user_id、item_id、event_time| H[W/prediction_input/D.csv]
+    H -->|映射到固定商品编号并按时间排序| R
+    C -->|重复预测读取固定 train / valid / test.inter 和 feat1CLS| R
     Y --> R
     R --> Z[W/results/D-recommendations.csv]
 ```
@@ -187,6 +192,8 @@ flowchart LR
 图中 `D` 是 `--dataset` 的值。现有用户和商品交互次数过滤后，预处理对每位用户保留最近 `--max-seq-length` 次交互（默认 50，范围 3–100）。训练使用除最后两次外的交互，倒数第二次作为验证目标，最后一次作为测试目标；`predict.inter` 使用保留的完整序列供生产预测。预测为全部预测用户计算全量商品分数，屏蔽 padding 和用户完整输入序列中的历史商品，然后按分数降序直接选择最多 `--top-k` 个商品。
 
 预测只生成 `<dataset>-recommendations.csv`，采用逐条推荐格式 `user_id,item_id,score`。每位用户的结果按模型分数降序写入；可推荐的未交互商品少于 `--top-k` 时，该用户的输出行数会相应减少。
+
+微调完成后，使用 `--stage predict` 加新的完整用户历史即可重复预测。该路径不会调用文本编码器或训练器，也不会改写 `downstream/<dataset>/` 中的训练产物；每次仍会加载微调模型并计算候选商品在该模型下的表示。
 
 ## 各阶段 Bash 命令与参数
 
@@ -449,18 +456,35 @@ bash run.sh --stage finetune \
 
 ### 5. predict：生成推荐结果
 
-预测阶段只执行模型推理：读取预处理产生的完整用户序列和商品文本向量，加载微调模型，为全部预测用户生成 TopK 结果并写入一份 CSV。
+预测阶段加载已微调模型和固定商品向量，为本次输入的用户生成 TopK 结果。不指定新的输入来源时，沿用预处理时生成的 `predict.inter`；指定来源时，读取本次完整用户交互历史，不重新编码商品或微调模型。
 
-#### 执行示例
+#### 使用新交互数据重复预测（CSV）
 
 ```bash
 bash run.sh --stage predict \
   --dataset catalog \
+  --input-csv /path/to/current_interactions.csv \
   --finetuned-checkpoint "$WORK_DIR/checkpoints/finetune/UniSRec-catalog-finetuned.pth" \
+  --max-seq-length 50 \
   --top-k 50 \
   --work-dir "$WORK_DIR" \
   --python "$PYTHON_BIN"
 ```
+
+CSV 至少包含 `user_id,item_id,event_time` 三列，每位待预测用户提供截至当前的完整历史。`--max-seq-length` 建议与准备训练数据时一致。
+
+ODPS 数据可将 `--input-csv` 换成 `--input-table NAME`，或使用下面的 SQL 文件方式：
+
+```bash
+bash run.sh --stage predict \
+  --dataset catalog \
+  --input-query-file /path/to/current_interactions.sql \
+  --env-file /path/to/.env \
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
+```
+
+如需对预处理时保存的用户序列再次预测，省略三种 `--input-*` 参数即可。
 
 #### 可执行参数
 
@@ -468,19 +492,26 @@ bash run.sh --stage predict \
 | --- | --- | --- | --- |
 | `--stage predict` | 是 | 无 | 只执行预测。 |
 | `--dataset NAME` | 是 | 无 | 指定预处理数据集和结果文件名前缀。 |
+| `--input-csv FILE` | 否 | 读取已有 `predict.inter` | 本次预测用户的完整交互历史 CSV；与其他两种来源最多选一个。 |
+| `--input-table NAME` | 否 | 同上 | ODPS 交互表；读取整表，与其他两种来源最多选一个。 |
+| `--input-query-file FILE` | 否 | 同上 | ODPS SQL 文件；可在 SQL 中筛选待预测用户，与其他两种来源最多选一个。 |
+| `--env-file FILE` | ODPS 输入使用 | 项目根目录 `.env` | ODPS 连接配置；CSV 输入不读取。 |
 | `--finetuned-checkpoint FILE` | 否 | `DIR/checkpoints/finetune/UniSRec-NAME-finetuned.pth` | 指定微调模型；省略时使用工作目录中的默认文件。 |
+| `--max-seq-length N` | 否 | `50` | 新输入中每位用户保留最近 N 次有效交互，范围 `3–100`，不能超过模型配置的历史序列上限。 |
 | `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
-| `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取预处理产物和默认模型，结果写入 `DIR/results/`。 |
+| `--work-dir DIR` | 否 | 项目内 `outputs/` | 读取固定训练产物和默认模型；新输入标准化到 `DIR/prediction_input/`，结果写入 `DIR/results/`。 |
 | `--python EXECUTABLE` | 否 | `python3` | 执行模型推理。GPU 环境建议使用 Conda Python 的绝对路径。 |
 
 `predict` 会屏蔽 padding 商品和每位用户输入序列中的全部历史商品，再按模型分数降序写出最多 `--top-k` 条结果。未交互商品不足时，该用户的输出可能少于 `--top-k` 条。
+
+重复预测会跳过不在固定商品集合中的交互、空字段和无效时间，并打印跳过数量。若没有任何有效用户历史，预测失败。重复运行同一数据集时，结果文件会被本次输出覆盖；固定训练产物应保留原样。
 
 #### 前置文件
 
 ```text
 <work-dir>/downstream/<dataset>/<dataset>.train.inter
 <work-dir>/downstream/<dataset>/<dataset>.valid.inter
-<work-dir>/downstream/<dataset>/<dataset>.predict.inter
+<work-dir>/downstream/<dataset>/<dataset>.test.inter（新交互预测）或 <dataset>.predict.inter（沿用旧序列）
 <work-dir>/downstream/<dataset>/<dataset>.feat1CLS
 <work-dir>/downstream/<dataset>/index2user.json
 <work-dir>/downstream/<dataset>/index2item.json

@@ -10,12 +10,12 @@ Run one stage or the complete interaction-to-recommendation pipeline.
 Options:
   --stage NAME         all, fetch, preprocess, pretrain, finetune, or predict (default: all)
   --dataset NAME       Dataset name used for intermediate files (required)
-  --input-csv FILE     Interaction CSV for fetch (alternative to --input-table)
-  --input-table NAME   ODPS interaction table for fetch
-  --input-query-file FILE  ODPS SQL for fetch (alternative to table)
+  --input-csv FILE     Interaction CSV for fetch or a standalone predict stage
+  --input-table NAME   ODPS interaction table for fetch or standalone predict
+  --input-query-file FILE  ODPS SQL for fetch or standalone predict
   --work-dir DIR       Raw data, processed data, checkpoints, and results (default: project outputs/)
   --plm-path DIR       Local text encoder directory (default: ./bert-base-uncased)
-  --max-seq-length N   Recent interactions retained per user in preprocess (default: 50; 3-100)
+  --max-seq-length N   Recent interactions retained per user (default: 50; 3-100)
   --env-file FILE      ODPS connection file (default: project .env)
   --python EXECUTABLE  Python executable (default: python3)
   --top-k NUMBER       Number of recommended items (default: 50)
@@ -95,13 +95,15 @@ if [[ ! "$dataset" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
   echo "--dataset is required and must contain letters, digits, or underscores, starting with a letter" >&2
   exit 2
 fi
-if [[ "$stage" == all || "$stage" == fetch ]]; then
-  sources=0
-  for source in "$input_csv" "$input_table" "$input_query_file"; do if [[ -n "$source" ]]; then ((sources+=1)); fi; done
-  if ((sources != 1)); then
-    echo "Choose exactly one of --input-csv, --input-table, or --input-query-file for fetch" >&2
-    exit 2
-  fi
+sources=0
+for source in "$input_csv" "$input_table" "$input_query_file"; do if [[ -n "$source" ]]; then ((sources+=1)); fi; done
+if [[ "$stage" == all || "$stage" == fetch ]] && ((sources != 1)); then
+  echo "Choose exactly one of --input-csv, --input-table, or --input-query-file for fetch" >&2
+  exit 2
+fi
+if [[ "$stage" == predict ]] && ((sources > 1)); then
+  echo "Choose at most one of --input-csv, --input-table, or --input-query-file for predict" >&2
+  exit 2
 fi
 if [[ ! "$top_k" =~ ^[1-9][0-9]*$ ]]; then
   echo "--top-k must be a positive integer" >&2
@@ -122,12 +124,12 @@ if [[ "$stage" == all || "$stage" == preprocess ]]; then
   fi
   plm_path=$(cd "$plm_path" && pwd)
 fi
-if [[ ( "$stage" == all || "$stage" == fetch ) && -n "$input_csv" && ! -f "$input_csv" ]] ||
-   [[ ( "$stage" == all || "$stage" == fetch ) && -n "$input_query_file" && ! -f "$input_query_file" ]]; then
+if [[ ( "$stage" == all || "$stage" == fetch || "$stage" == predict ) && -n "$input_csv" && ! -f "$input_csv" ]] ||
+   [[ ( "$stage" == all || "$stage" == fetch || "$stage" == predict ) && -n "$input_query_file" && ! -f "$input_query_file" ]]; then
   echo "Interaction input file does not exist" >&2
   exit 2
 fi
-if [[ ( "$stage" == all || "$stage" == fetch ) && ( -n "$input_table" || -n "$input_query_file" ) ]]; then
+if [[ ( "$stage" == all || "$stage" == fetch || "$stage" == predict ) && ( -n "$input_table" || -n "$input_query_file" ) ]]; then
   if [[ ! -f "$env_file" ]]; then
     echo "ODPS credentials file does not exist: $env_file" >&2
     exit 2
@@ -192,6 +194,7 @@ data_dir=$work_dir/downstream
 pretrain_dir=$work_dir/checkpoints/pretrain
 finetune_dir=$work_dir/checkpoints/finetune
 result_dir=$work_dir/results
+prediction_input_dir=$work_dir/prediction_input
 
 cd "$repo_dir"
 
@@ -270,8 +273,15 @@ finetune() {
 
 predict() {
   local checkpoint=$1
-  check_data train.inter valid.inter predict.inter feat1CLS
-  if [[ ! -f "$data_dir/$dataset/index2user.json" || ! -f "$data_dir/$dataset/index2item.json" ]]; then
+  local args=(-d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir"
+    --data-path "$data_dir")
+  if [[ "$stage" == predict ]] && ((sources == 1)); then
+    check_data train.inter valid.inter test.inter feat1CLS
+  else
+    check_data train.inter valid.inter predict.inter feat1CLS
+  fi
+  if [[ ! -f "$data_dir/$dataset/index2item.json" ]] ||
+     { [[ "$stage" != predict || "$sources" == 0 ]] && [[ ! -f "$data_dir/$dataset/index2user.json" ]]; }; then
     echo "Prediction ID mapping files are missing in $data_dir/$dataset" >&2
     exit 1
   fi
@@ -279,9 +289,22 @@ predict() {
     echo "Fine-tuned checkpoint does not exist: $checkpoint" >&2
     exit 1
   fi
+  if [[ "$stage" == predict ]] && ((sources == 1)); then
+    mkdir -p "$prediction_input_dir"
+    local source_args=(--dataset "$dataset" --output-dir "$prediction_input_dir" --prediction-only)
+    if [[ -n "$input_csv" ]]; then
+      source_args+=(--input-csv "$input_csv")
+    elif [[ -n "$input_query_file" ]]; then
+      source_args+=(--input-query-file "$input_query_file" --env-file "$env_file")
+    else
+      source_args+=(--input-table "$input_table" --env-file "$env_file")
+    fi
+    "$python" data_pipeline/raw/prepare_interactions.py "${source_args[@]}"
+    args+=(--interactions-file "$prediction_input_dir/$dataset.csv"
+      --max-seq-length "$max_seq_length")
+  fi
   mkdir -p "$result_dir"
-  "$python" predict.py -d "$dataset" -fp "$checkpoint" -t "$top_k" -sp "$result_dir" \
-    --data-path "$data_dir"
+  "$python" predict.py "${args[@]}"
 }
 
 stage_info() {
@@ -299,8 +322,9 @@ stage_info() {
       printf 'input=%s checkpoint=%s output=%s' \
         "$data_dir/$dataset" "$2" "$finetune_dir" ;;
     predict)
+      local input=${input_csv:-${input_query_file:-${input_table:-$data_dir/$dataset/$dataset.predict.inter}}}
       printf 'input=%s checkpoint=%s output=%s' \
-        "$data_dir/$dataset/$dataset.predict.inter" "$2" "$result_dir" ;;
+        "$input" "$2" "$result_dir" ;;
   esac
 }
 

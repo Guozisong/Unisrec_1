@@ -103,6 +103,43 @@ class PipelineTest(unittest.TestCase):
                     if stage == 'finetune':
                         self.assertIn('--no-fix-encoder', log.read_text())
 
+            current_csv = work / 'current-interactions.csv'
+            current_csv.write_text('user_id,item_id,event_time\nnew-user,item-1,1791874162374\n')
+            log.write_text('')
+            repeated = subprocess.run(
+                ['bash', str(ROOT / 'run.sh'), '--stage', 'predict', '--dataset', dataset,
+                 '--work-dir', str(work), '--python', str(fake_python),
+                 '--input-csv', str(current_csv), '--max-seq-length', '40'],
+                cwd=work, env={**os.environ, 'STAGE_LOG': str(log)},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            calls = log.read_text().splitlines()
+            self.assertEqual([Path(line.split()[0]).name for line in calls],
+                             ['prepare_interactions.py', 'predict.py'])
+            self.assertIn('--prediction-only', calls[0])
+            self.assertIn('--interactions-file', calls[1])
+            self.assertIn('--max-seq-length 40', calls[1])
+
+            current_query = work / 'current-interactions.sql'
+            current_query.write_text('SELECT user_id, item_id, event_time FROM interactions')
+            current_env = work / '.env'
+            current_env.touch()
+            log.write_text('')
+            repeated_odps = subprocess.run(
+                ['bash', str(ROOT / 'run.sh'), '--stage', 'predict', '--dataset', dataset,
+                 '--work-dir', str(work), '--python', str(fake_python),
+                 '--input-query-file', str(current_query), '--env-file', str(current_env)],
+                cwd=work, env={**os.environ, 'STAGE_LOG': str(log)},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(repeated_odps.returncode, 0, repeated_odps.stderr)
+            odps_calls = log.read_text().splitlines()
+            self.assertEqual([Path(line.split()[0]).name for line in odps_calls],
+                             ['prepare_interactions.py', 'predict.py'])
+            self.assertIn('--input-query-file', odps_calls[0])
+            self.assertIn('--env-file', odps_calls[0])
+
             resume_checkpoint = work / 'checkpoints' / 'pretrain' / 'epoch-12.pth'
             resume_checkpoint.touch()
             log.write_text('')

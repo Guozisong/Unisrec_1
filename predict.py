@@ -8,6 +8,7 @@ import torch
 from recbole.config import Config
 from recbole.data import data_preparation
 
+from data_pipeline.preprocessing.prediction_input import load_prediction_histories
 from recbole_data.dataset import UniSRecDataset
 from unisrec import UniSRec
 
@@ -22,6 +23,13 @@ def build_original_id_lookup(id_tokens, original_ids):
         None if str(token) == '[PAD]' else original_ids[str(token)]
         for token in id_tokens
     ]
+
+
+def pad_prediction_batch(histories, max_length):
+    users = [user_id for user_id, _ in histories]
+    sequences = [item_ids[-max_length:] for _, item_ids in histories]
+    lengths = [len(item_ids) for item_ids in sequences]
+    return users, [item_ids + [0] * (max_length - len(item_ids)) for item_ids in sequences], lengths
 
 
 def write_prediction_rows(writer, user_ids, item_ids, scores,
@@ -39,9 +47,11 @@ def write_prediction_rows(writer, user_ids, item_ids, scores,
     return row_count
 
 
-def predictor(dataset, model_file, top_k, result_save_path, data_path=None):
+def predictor(dataset, model_file, top_k, result_save_path, data_path=None,
+              interactions_file=None, max_seq_length=50):
     config_files = ['configs/UniSRec.yaml', 'configs/finetune.yaml']
-    overrides = {'benchmark_filename': ['train', 'valid', 'predict']}
+    benchmark_files = ['train', 'valid', 'test'] if interactions_file else ['train', 'valid', 'predict']
+    overrides = {'benchmark_filename': benchmark_files}
     if data_path:
         overrides['data_path'] = data_path
     config = Config(
@@ -57,15 +67,24 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None):
     _, _, prediction_data = data_preparation(config, dataset_object)
 
     dataset_path = config['data_path']
-    with open(os.path.join(dataset_path, 'index2user.json'), encoding='utf-8') as file:
-        index2user = json.load(file)
     with open(os.path.join(dataset_path, 'index2item.json'), encoding='utf-8') as file:
         index2item = json.load(file)
 
-    user_lookup = build_original_id_lookup(
-        dataset_object.field2id_token[config['USER_ID_FIELD']], index2user)
+    if interactions_file is None:
+        with open(os.path.join(dataset_path, 'index2user.json'), encoding='utf-8') as file:
+            index2user = json.load(file)
+        user_lookup = build_original_id_lookup(
+            dataset_object.field2id_token[config['USER_ID_FIELD']], index2user)
     item_lookup = build_original_id_lookup(
         dataset_object.field2id_token[config['ITEM_ID_FIELD']], index2item)
+    if interactions_file is not None:
+        if max_seq_length > config['MAX_ITEM_LIST_LENGTH']:
+            raise ValueError('--max-seq-length exceeds the model sequence length limit')
+        item_ids = {original_id: model_id for model_id, original_id in enumerate(item_lookup)
+                    if original_id is not None}
+        histories, skipped = load_prediction_histories(
+            interactions_file, item_ids, max_seq_length)
+        print(f'[predict] Loaded {len(histories)} users; skipped {skipped} invalid or unknown-item interactions')
 
     print('[predict] Loading model')
     model = UniSRec(config, prediction_data.dataset).to(device)
@@ -88,8 +107,27 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None):
             writer = csv.writer(output_file, lineterminator='\n')
             writer.writerow(('user_id', 'item_id', 'score'))
 
-            for batched_data in prediction_data:
-                interaction = batched_data[0].to(device)
+            if interactions_file is None:
+                batches = prediction_data
+            else:
+                batch_size = config['eval_batch_size']
+                batches = (histories[start:start + batch_size]
+                           for start in range(0, len(histories), batch_size))
+            for batch in batches:
+                if interactions_file is None:
+                    interaction = batch[0].to(device)
+                    user_ids = interaction[config['USER_ID_FIELD']].detach().cpu().tolist()
+                    current_user_lookup = user_lookup
+                else:
+                    current_user_lookup, sequences, lengths = pad_prediction_batch(
+                        batch, config['MAX_ITEM_LIST_LENGTH'])
+                    interaction = {
+                        config['ITEM_ID_FIELD'] + config['LIST_SUFFIX']: torch.tensor(
+                            sequences, dtype=torch.long, device=device),
+                        config['ITEM_LIST_LENGTH_FIELD']: torch.tensor(
+                            lengths, dtype=torch.long, device=device),
+                    }
+                    user_ids = range(len(current_user_lookup))
                 item_sequences = interaction[
                     config['ITEM_ID_FIELD'] + config['LIST_SUFFIX']]
                 scores = model.full_sort_predict_with_item_embeddings(
@@ -101,10 +139,10 @@ def predictor(dataset, model_file, top_k, result_save_path, data_path=None):
                     scores, k=recommendation_count, dim=1)
                 row_count += write_prediction_rows(
                     writer,
-                    interaction[config['USER_ID_FIELD']].detach().cpu().tolist(),
+                    user_ids,
                     topk_items.detach().cpu().tolist(),
                     topk_scores.detach().cpu().tolist(),
-                    user_lookup,
+                    current_user_lookup,
                     item_lookup,
                 )
 
@@ -122,9 +160,14 @@ def parse_args():
     parser.add_argument(
         '-sp', default='outputs/results/', help='result directory')
     parser.add_argument('--data-path', help='parent directory of the dataset')
+    parser.add_argument('--interactions-file', help='current user interaction CSV for repeated prediction')
+    parser.add_argument('--max-seq-length', type=int, default=50,
+                        help='recent interactions retained per user (1-100)')
     args = parser.parse_args()
     if args.t < 1:
         parser.error('-t must be a positive integer')
+    if not 1 <= args.max_seq_length <= 100:
+        parser.error('--max-seq-length must be from 1 to 100')
     return args
 
 
@@ -136,4 +179,6 @@ if __name__ == '__main__':
         arguments.t,
         arguments.sp,
         arguments.data_path,
+        arguments.interactions_file,
+        arguments.max_seq_length,
     )
