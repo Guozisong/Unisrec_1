@@ -19,8 +19,11 @@ def load_ratings(file):
                 user_id, item_id, event_value, event_time, item_text = line
                 if '' in (user_id, item_id, event_value, event_time, item_text):
                     continue
-                ts = datetime.datetime.strptime(event_time, '%Y-%m-%d').timestamp()
-                inters.add((user_id, item_id, float(event_value), int(ts)))
+                if len(event_time) == 13 and event_time.isdigit():
+                    ts = int(event_time)
+                else:
+                    ts = int(datetime.datetime.strptime(event_time, '%Y-%m-%d').timestamp() * 1000)
+                inters.add((user_id, item_id, float(event_value), ts))
             except ValueError:
                 print(line)
     return inters

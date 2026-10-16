@@ -32,10 +32,10 @@ outputs/                       默认产物目录，由 Git 忽略
 | `user_id` | 原始用户 ID | `u001` |
 | `item_id` | 原始商品或内容 ID | `i001` |
 | `event_value` | 交互权重；当前预处理会读取为数字 | `1` |
-| `event_time` | 交互日期；用于用户序列排序 | `2026-01-01` |
+| `event_time` | 交互时间；用于用户序列排序 | `1791874162374`（13 位毫秒时间戳）或 `2026-01-01` |
 | `item_text` | 文本编码器使用的商品描述 | `Item title and attributes` |
 
-本项目早期 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式，无需修改原 ODPS 表。上游 UniSRec 的原始数据预处理因数据集而异；本项目预处理后生成的 RecBole 原子文件使用 `user_id`、`item_id_list`、`item_id` 等模型输入字段，以及商品文本向量文件。预处理跳过原始字段中有空值的行；日期需要是 `YYYY-MM-DD`。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
+本项目早期 ODPS 导出字段 `user_id,prod_id,purchase_count,dt,attrvalues` 也可被 `fetch` 转换为上述统一格式，无需修改原 ODPS 表。上游 UniSRec 的原始数据预处理因数据集而异；本项目预处理后生成的 RecBole 原子文件使用 `user_id`、`item_id_list`、`item_id` 等模型输入字段，以及商品文本向量文件。预处理跳过原始字段中有空值的行；`event_time` 支持 13 位毫秒时间戳或 `YYYY-MM-DD` 日期，其他格式的行会被跳过。日期按运行环境的本地时区转换为时间戳。`--input-table` 会读取表的全部行；需要日期过滤、列别名或其他查询条件时，使用 `--input-query-file` 提供 SQL。当前预处理依赖商品文本，不能仅凭用户和商品 ID 训练。
 
 ## 环境与目录
 
