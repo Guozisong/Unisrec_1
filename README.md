@@ -93,7 +93,7 @@ bash run.sh --stage all --dataset catalog \
   --work-dir /path/to/work_dir
 ```
 
-ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_table`，或使用 `--input-query-file /path/to/query.sql`，并用 `--env-file /path/to/.env` 指向连接配置。预测阶段只读取预处理数据和微调模型，不连接 ODPS。
+ODPS 输入时，把 `--input-csv` 替换为 `--input-table your_interaction_table`，或使用 `--input-query-file /path/to/query.sql`，并用 `--env-file /path/to/.env` 指向连接配置。单独执行 `predict` 时，只有显式传入 `--input-table` 或 `--input-query-file` 才会连接 ODPS。
 
 查询文件必须返回交互数据契约中的五列，历史字段也受支持。需要原来的近期交互窗口时，可在 SQL 中继续使用日期条件。请审查实际 SQL。
 
@@ -191,7 +191,7 @@ flowchart LR
 
 图中 `D` 是 `--dataset` 的值。现有用户和商品交互次数过滤后，预处理对每位用户保留最近 `--max-seq-length` 次交互（默认 50，范围 3–100）。训练使用除最后两次外的交互，倒数第二次作为验证目标，最后一次作为测试目标；`predict.inter` 使用保留的完整序列供生产预测。预测为全部预测用户计算全量商品分数，屏蔽 padding 和用户完整输入序列中的历史商品，然后按分数降序直接选择最多 `--top-k` 个商品。
 
-预测只生成 `<dataset>-recommendations.csv`，采用逐条推荐格式 `user_id,item_id,score`。每位用户的结果按模型分数降序写入；可推荐的未交互商品少于 `--top-k` 时，该用户的输出行数会相应减少。
+预测结果写入 `<work-dir>/results/<dataset>-recommendations.csv`，采用逐条推荐格式 `user_id,item_id,score`。每位用户的结果按模型分数降序写入；可推荐的未交互商品少于 `--top-k` 时，该用户的输出行数会相应减少。
 
 微调完成后，使用 `--stage predict` 加新的完整用户历史即可重复预测。该路径不会调用文本编码器或训练器，也不会改写 `downstream/<dataset>/` 中的训练产物；每次仍会加载微调模型并计算候选商品在该模型下的表示。
 
@@ -253,7 +253,7 @@ bash run.sh --stage all \
 | `--max-seq-length N` | 否 | `50` | 每位用户保留的最近交互数，必须是 `3–100` 的整数。 |
 | `--no-fix-encoder` | 否 | 不指定 | 在流水线的微调阶段更新 Transformer 编码器和位置嵌入；不指定时冻结这两部分参数。 |
 | `--top-k NUMBER` | 否 | `50` | 每位用户最多输出的推荐数，必须是正整数。 |
-| `--env-file FILE` | ODPS 输入使用 | 项目根目录 `.env` | `--input-table` 或 `--input-query-file` 模式的连接配置。纯 CSV 流程与预测阶段不读取。 |
+| `--env-file FILE` | ODPS 输入使用 | 项目根目录 `.env` | `--input-table` 或 `--input-query-file` 模式的连接配置。纯 CSV 流程与未指定新来源的预测阶段不读取。 |
 | `--work-dir DIR` | 否 | 项目内 `outputs/` | 保存所有中间数据、检查点和预测结果。 |
 | `--python EXECUTABLE` | 否 | `python3` | 全部 Python 阶段使用的解释器。 |
 
@@ -456,7 +456,21 @@ bash run.sh --stage finetune \
 
 ### 5. predict：生成推荐结果
 
-预测阶段加载已微调模型和固定商品向量，为本次输入的用户生成 TopK 结果。不指定新的输入来源时，沿用预处理时生成的 `predict.inter`；指定来源时，读取本次完整用户交互历史，不重新编码商品或微调模型。
+预测阶段加载已微调模型和固定商品向量，为用户生成 TopK 结果。输入来源只由 `--stage predict` 命令中的参数判定：
+
+- 不传 `--input-csv`、`--input-table`、`--input-query-file`：读取 `<work-dir>/downstream/<dataset>/<dataset>.predict.inter` 中预处理时保存的用户序列。
+- 传入上述三个参数中的一个：读取本次指定的完整用户交互历史，标准化为 `<work-dir>/prediction_input/<dataset>.csv` 后预测。此方式不会生成或改写 `downstream/<dataset>/` 中的 `predict.inter`、`index2user.json` 等文件，也不会重新编码商品或微调模型。
+
+三个来源参数最多指定一个。程序不会自动查找工作目录中的 CSV；`--work-dir` 和 `--finetuned-checkpoint` 也不会改变输入来源。
+
+#### 沿用预处理时的用户序列
+
+```bash
+bash run.sh --stage predict \
+  --dataset catalog \
+  --work-dir "$WORK_DIR" \
+  --python "$PYTHON_BIN"
+```
 
 #### 使用新交互数据重复预测（CSV）
 
@@ -483,8 +497,6 @@ bash run.sh --stage predict \
   --work-dir "$WORK_DIR" \
   --python "$PYTHON_BIN"
 ```
-
-如需对预处理时保存的用户序列再次预测，省略三种 `--input-*` 参数即可。
 
 #### 可执行参数
 
